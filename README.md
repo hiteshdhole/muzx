@@ -11,3 +11,7 @@
 
 % mkdir muzx
 git clone
+
+# HOW TO USE
+
+g++ main.cpp -o player -lsfml-audio -lsfml-system
