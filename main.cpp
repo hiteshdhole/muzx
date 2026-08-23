@@ -29,7 +29,13 @@ int main() {
     std::cerr << "Error: Music cannot be loaded" << std::endl;
     return 1;
   }
+  std::cout << " ================MUZX PLAYLIST==================" << std::endl;
 
+  for (std::size_t i = 0; i < playlist.size(); i++) {
+    std::cout << i + 1 << " . " << playlist[i] << std::endl;
+  }
+
+  std::cout << "================================================" << std::endl;
   std::cout << "The music loaded successfully" << playlist[currentSong]
             << std::endl;
   std::cout << "Version    : 0.1 " << std::endl;
