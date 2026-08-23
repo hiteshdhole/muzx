@@ -1,4 +1,5 @@
 #include <SFML/Audio.hpp>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -9,12 +10,19 @@ int main() {
   // Playlist
   std::vector<std::string> playlist;
 
-  playlist.push_back("test1.mp3");
-  playlist.push_back("music/test2.mp3");
-  playlist.push_back("music/test3.mp3");
+  for (const auto &file : std::filesystem::directory_iterator("music")) {
+    if (file.path().extension() == ".mp3") {
+      playlist.push_back(file.path().string());
+    }
+  }
+
+  if (playlist.empty()) {
+    std::cerr << "NO MP3 files found in the music folder " << std::endl;
+    return 1;
+  }
 
   // Current song index
-  int currentSong = 0;
+  std::size_t currentSong = 0;
 
   // Load first song
   if (!song.openFromFile(playlist[currentSong])) {
@@ -22,7 +30,8 @@ int main() {
     return 1;
   }
 
-  std::cout << "The music loaded successfully" << std::endl;
+  std::cout << "The music loaded successfully" << playlist[currentSong]
+            << std::endl;
   std::cout << "Version    : 0.1 " << std::endl;
   std::cout << "Created by : Hitesh " << std::endl;
   std::cout << "[p] Play [o] Pause [q] Quit [n] Next [b] Previous" << std::endl;
@@ -52,8 +61,7 @@ int main() {
 
     else if (command == "n") {
       if (currentSong < playlist.size() - 1) {
-        currentSong++;
-
+        currentSong++; // currentSong = currentSong +  1
         song.stop();
 
         if (!song.openFromFile(playlist[currentSong])) {
@@ -71,7 +79,7 @@ int main() {
 
     else if (command == "b") {
       if (currentSong > 0) {
-        currentSong--;
+        currentSong--; // currentSong = currentSong - 1
 
         song.stop();
 
