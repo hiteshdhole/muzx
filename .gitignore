@@ -1,2 +1,10 @@
+
+# Music files
 music/
 *.mp3
+
+# Compiled program
+player
+
+# Build files
+build/

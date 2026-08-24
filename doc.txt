@@ -1,0 +1,935 @@
+
+MUZX — C++ Terminal Music Player
+
+1. Project Overview
+>>Muzx is a terminal-based music player written in C++.
+>>The project is being developed to learn C++ practically while building a useful application.
+
+Main goals:-
+-Play audio files from the terminal
+-Pause and resume music
+-Move to the next song
+-Move to the previous song
+-Automatically detect music files
+-Display a playlist
+-Eventually support keyboard controls without pressing Enter
+-Organize the project into multiple C++ files
+-Learn C++ concepts through a real project
+
+Tool	Purpose
+-C++	Main programming language
+-SFML	Audio playback
+-g++	C++ compiler
+-Git	Version control
+-GitHub	Code repository
+-Linux terminal	Program interface
+-<filesystem>	Find music files
+-<vector>	Store playlist
+-<termios.h>	Terminal keyboard control
+-<unistd.h>	Low-level Linux input
+
+
+2. Current Project Structure
+
+Your project currently looks approximately like:
+
+muzx/
+├── main.cpp
+├── player
+├── music/
+│   ├── song1.mp3
+│   ├── song2.mp3
+│   └── ...
+├── .gitignore
+└── README.md
+
+Important
+
+-The music/ directory is ignored by Git so that your MP3 files aren't uploaded to GitHub.
+-Your .gitignore contains:
+
+music/
+*.mp3
+player
+build/
+
+
+3. SFML
+
+What is SFML?
+
+SFML — Simple and Fast Multimedia Library — is a C++ library that provides functionality for:
+Audio
+Graphics
+Window management
+Input
+Networking
+System utilities
+
+For Muzx, we're mainly using:
+
+#include <SFML/Audio.hpp>
+
+because we need audio playback.
+
+
+4. sf::Music
+
+The main SFML object in Muzx is:
+
+sf::Music song;
+
+Think of it as the audio player.
+
+It allows us to:
+
+song.play();
+song.pause();
+song.stop();
+
+and load music:
+
+song.openFromFile("music/song.mp3");
+Basic flow
+Music file
+    ↓
+openFromFile()
+    ↓
+sf::Music
+    ↓
+play()
+    ↓
+Speaker
+5. openFromFile()
+
+We use:
+
+song.openFromFile(filename);
+
+This loads an audio file into the sf::Music object.
+
+It returns a boolean value.
+
+Successful
+if (song.openFromFile(filename))
+{
+    // File loaded
+}
+Failed
+if (!song.openFromFile(filename))
+{
+    std::cerr << "Error: Music cannot be loaded";
+}
+
+The ! means NOT.
+
+So:
+
+!song.openFromFile(...)
+
+means:
+
+If the music failed to load.
+
+
+6. Play
+
+song.play();
+
+Starts or resumes the music.
+
+Example:
+
+else if (command == 'p')
+{
+    song.play();
+}
+7. Pause
+song.pause();
+
+Pauses the music.
+
+Important difference:
+
+pause()
+    ↓
+remembers position
+    ↓
+play()
+    ↓
+continues from that position
+
+Whereas:
+
+stop()
+    ↓
+stops playback
+    ↓
+position returns to beginning
+8. Stop
+song.stop();
+
+We use this when changing songs.
+
+Example:
+
+song.stop();
+
+song.openFromFile(playlist[currentSong]);
+
+song.play();
+
+The process is:
+
+Old song
+   ↓
+stop
+   ↓
+load new song
+   ↓
+play
+
+
+9. C++ string
+
+We use:
+
+#include <string>
+
+and:
+
+std::string
+
+A string stores text.
+
+For example:
+
+std::string filename;
+
+can contain:
+
+"test.mp3"
+
+or:
+
+"music/song1.mp3"
+
+
+10. User Input
+
+Initially, Muzx used:
+
+std::cin >> command;
+
+Example:
+
+-> n
+
+The program waits until the user presses Enter.
+
+This is called normal buffered terminal input.
+
+Later, we started working on single-key input so that:
+
+n
+
+immediately executes the next-song command.
+
+
+11. vector
+
+We use:
+
+#include <vector>
+
+and:
+
+std::vector<std::string> playlist;
+
+A vector is a dynamic array.
+
+It allows us to store multiple songs.
+
+Example:
+
+std::vector<std::string> playlist;
+
+playlist.push_back("song1.mp3");
+playlist.push_back("song2.mp3");
+playlist.push_back("song3.mp3");
+
+The vector becomes:
+
+Index       Song
+
+  0         song1.mp3
+  1         song2.mp3
+  2         song3.mp3
+
+
+12. push_back()
+
+We use:
+
+playlist.push_back(filename);
+
+to add an item to the vector.
+
+For example:
+
+playlist.push_back("music/song1.mp3");
+
+means:
+
+Add "music/song1.mp3" to the playlist.
+
+
+13. Vector Index
+
+C++ starts indexing from 0.
+
+For:
+
+song1
+song2
+song3
+
+the indexes are:
+
+0 → song1
+1 → song2
+2 → song3
+
+Therefore:
+
+playlist[0]
+
+means the first song.
+
+And:
+
+playlist[1]
+
+means the second song.
+
+
+14. currentSong
+
+We use:
+
+std::size_t currentSong = 0;
+
+This stores the index of the currently selected song.
+
+Example:
+
+currentSong = 0
+       ↓
+playlist[0]
+       ↓
+song1.mp3
+
+If:
+
+currentSong = 1;
+
+then:
+
+playlist[1]
+    ↓
+song2.mp3
+
+This variable is what makes Next and Previous possible.
+
+
+15. Next Song — n
+
+The basic logic is:
+
+currentSong++;
+
+++ means:
+
+Increase the value by 1.
+
+Example:
+
+currentSong = 0
+
+n
+↓
+currentSong++
+
+0 → 1
+
+Then:
+
+song.openFromFile(playlist[currentSong]);
+
+loads the next song.
+
+Complete concept
+n
+↓
+check if next exists
+↓
+currentSong++
+↓
+stop old song
+↓
+load new song
+↓
+play new song
+16. Why the Next condition is needed
+
+We use:
+
+if (currentSong < playlist.size() - 1)
+
+Suppose there are three songs:
+
+[0] song1
+[1] song2
+[2] song3
+
+The last valid index is:
+
+2
+
+So if:
+
+currentSong == 2
+
+we cannot do:
+
+currentSong++;
+
+because that would produce:
+
+3
+
+and:
+
+playlist[3]
+
+doesn't exist.
+
+Therefore the condition prevents going outside the vector.
+
+
+17. Previous Song — b
+
+Previous uses:
+
+currentSong--;
+
+-- means:
+
+Decrease the value by 1.
+
+Example:
+
+currentSong = 2
+
+b
+↓
+currentSong--
+
+2 → 1
+
+Then:
+
+song.openFromFile(playlist[currentSong]);
+
+loads the previous song.
+
+
+18. Why Previous needs a condition
+
+We use:
+
+if (currentSong > 0)
+
+Because:
+
+currentSong = 0
+
+is already the first song.
+
+If we did:
+
+currentSong--;
+
+we would get:
+
+0 → -1
+
+and:
+
+playlist[-1]
+
+is invalid.
+
+
+19. <filesystem>
+
+We added:
+
+#include <filesystem>
+
+This lets C++ interact with files and directories.
+
+Instead of manually doing:
+
+playlist.push_back("music/song1.mp3");
+playlist.push_back("music/song2.mp3");
+playlist.push_back("music/song3.mp3");
+
+we can scan the directory automatically.
+
+
+20. directory_iterator
+
+Muzx uses:
+
+for (const auto &file :
+     std::filesystem::directory_iterator("music"))
+
+This means:
+
+Go through every item inside the music directory.
+
+For example:
+
+music/
+├── song1.mp3
+├── song2.mp3
+├── cover.jpg
+└── song3.mp3
+
+The loop visits each item.
+
+21. File Extension
+
+We check:
+
+file.path().extension() == ".mp3"
+
+This asks:
+
+Is this file an MP3?
+
+For example:
+
+song1.mp3 → ".mp3" → ADD
+song2.mp3 → ".mp3" → ADD
+cover.jpg → ".jpg" → IGNORE
+
+Then:
+
+playlist.push_back(file.path().string());
+
+adds the MP3 path to the playlist.
+
+
+22. Automatic Playlist
+
+The complete concept is:
+
+music/
+   ↓
+filesystem
+   ↓
+find files
+   ↓
+check extension
+   ↓
+.mp3?
+   ↓ YES
+vector playlist
+
+So Muzx automatically discovers music.
+
+
+23. playlist.empty()
+
+We use:
+
+if (playlist.empty())
+
+This checks whether the vector contains anything.
+
+If there are no MP3 files:
+
+music/
+└── empty
+
+then:
+
+playlist.empty()
+
+is true.
+
+We display:
+
+No MP3 files found
+
+and exit.
+
+This prevents trying to access:
+
+playlist[0]
+
+when the playlist doesn't contain anything.
+
+
+24. std::size_t
+
+We eventually changed:
+
+int currentSong = 0;
+
+to:
+
+std::size_t currentSong = 0;
+
+Why?
+
+Because:
+
+playlist.size()
+
+returns a std::size_t.
+
+It's an unsigned integer type commonly used for sizes and indexes.
+
+For vectors and arrays, it's generally the appropriate type for indexing.
+
+
+25. Terminal Keyboard Input
+
+This is the feature we're currently working on.
+
+We included:
+
+#include <termios.h>
+#include <unistd.h>
+
+These are Linux/POSIX facilities.
+
+The goal is to allow:
+
+p → immediately play
+o → immediately pause
+n → immediately next
+b → immediately previous
+q → immediately quit
+
+without pressing Enter.
+
+
+26. termios
+
+Normally the terminal waits for Enter:
+
+n
+↓
+Enter
+↓
+program receives input
+
+With terminal settings changed using termios, we can make it:
+
+n
+↓
+program receives n immediately
+
+The important setting is:
+
+ICANON
+
+Canonical mode normally makes terminal input line-based.
+
+We disable it using:
+
+newt.c_lflag &= ~(ICANON | ECHO);
+
+
+27. ECHO
+
+ECHO controls whether the terminal automatically displays the characters you type.
+
+Disabling it means:
+
+press n
+
+doesn't necessarily print n automatically.
+
+Muzx can then decide what to display.
+
+
+28. read()
+
+From:
+
+#include <unistd.h>
+
+we can use:
+
+read(STDIN_FILENO, &key, 1);
+
+This reads one character from standard input.
+
+Conceptually:
+
+Keyboard
+   ↓
+read()
+   ↓
+char key
+   ↓
+'p' / 'n' / 'b' / 'q'
+
+
+29. Git
+
+Git is being used to keep versions of Muzx.
+
+Basic workflow:
+
+git status
+
+Check what changed.
+
+git add main.cpp
+
+Prepare the changes.
+
+git commit -m "Add playlist scanning"
+
+Save a version.
+
+git push
+
+Upload the commit to GitHub.
+
+
+30. .gitignore
+
+We don't want music files in GitHub.
+
+Therefore:
+
+music/
+*.mp3
+player
+
+The important distinction is:
+
+Git
+ ↓
+source code
+ ↓
+GitHub
+
+while:
+
+music/
+ ↓
+local computer only
+
+This keeps the repository small and avoids uploading copyrighted or unnecessary audio files.
+
+
+31. Compiler
+
+We're using:
+
+g++
+
+to compile the program.
+
+Our command:
+
+g++ main.cpp -o player -lsfml-audio -lsfml-system
+
+Breakdown:
+
+g++
+ ↓
+C++ compiler
+
+main.cpp
+ ↓
+source code
+
+-o player
+ ↓
+create executable called player
+
+-lsfml-audio
+ ↓
+link SFML Audio
+
+-lsfml-system
+ ↓
+link SFML System
+
+Then:
+
+./player
+
+runs the compiled program.
+
+
+32. Current Muzx Architecture
+
+At the moment:
+
+                    MUZX
+                      │
+              ┌───────┴────────┐
+              │                │
+           Playlist          Audio
+              │                │
+        filesystem          SFML
+              │                │
+         vector<string>    sf::Music
+              │                │
+              └───────┬────────┘
+                      │
+                 currentSong
+                      │
+             ┌────────┼────────┐
+             ↓        ↓        ↓
+            Play    Pause    Navigation
+                              │
+                         ┌────┴────┐
+                         ↓         ↓
+                        Next     Previous
+                         n          b
+
+
+33. Current Features
+Feature	Status
+C++ program	✅
+SFML audio	✅
+Load MP3	✅
+Play	✅
+Pause	✅
+Stop	✅
+Playlist vector	✅
+Automatic MP3 scanning	✅
+Next song	✅
+Previous song	✅
+Empty playlist check	✅
+Playlist display	✅
+Git repository	✅
+MP3 Git ignore	✅
+Single-key controls	🔧 In progress
+Song selection	⏳
+Volume control	⏳
+Progress/time display	⏳
+Shuffle	⏳
+Repeat	⏳
+Separate .hpp/.cpp architecture	⏳
+Proper UI	⏳
+34. Future Project Architecture
+
+Eventually, instead of putting everything in main.cpp, we'll separate the project:
+
+muzx/
+├── src/
+│   ├── main.cpp
+│   ├── AudioPlayer.cpp
+│   ├── Playlist.cpp
+│   └── UI.cpp
+│
+├── include/
+│   ├── AudioPlayer.hpp
+│   ├── Playlist.hpp
+│   └── UI.hpp
+│
+├── music/
+├── .gitignore
+├── CMakeLists.txt
+└── README.md
+Responsibilities
+
+AudioPlayer
+
+play
+pause
+stop
+load
+volume
+
+Playlist
+
+find songs
+store songs
+next
+previous
+current song
+
+UI
+
+display playlist
+display controls
+display current song
+
+main.cpp
+
+connect everything together
+
+That separation will make Muzx much easier to maintain as it grows.
+
+35. Learning Path Through Muzx
+
+The project is also your C++ learning roadmap:
+
+Variables
+   ↓
+if / else
+   ↓
+while loops
+   ↓
+functions
+   ↓
+strings
+   ↓
+vectors
+   ↓
+filesystem
+   ↓
+classes
+   ↓
+constructors/destructors
+   ↓
+headers (.hpp)
+   ↓
+multiple source files (.cpp)
+   ↓
+OOP
+   ↓
+CMake
+   ↓
+larger C++ project
+
+So Muzx isn't just a music player — it's effectively a C++ learning project.
+
+Tomorrow's immediate task
+
+We should finish the single-key input first:
+
+p → Play
+o → Pause
+n → Next
+b → Previous
+q → Quit
+
+with no Enter key.
+
+After that, I'd move to song selection + proper classes, rather than adding lots of features to the current main.cpp.
+
+

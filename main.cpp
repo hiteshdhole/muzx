@@ -2,8 +2,29 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <termios.h>
+#include <unistd.h>
 #include <vector>
 
+char getkey() {
+  termios oldt;
+  termios newt;
+
+  tcgetattr(STDIN_FILENO, &oldt);
+
+  newt = oldt;
+  newt.c_lflag &= ~(ICANON | ECHO);
+  // ICANON is responsible for waiting for the Enter key.
+  // ECHO is also disabled so the terminal doesn't automatically print the key.
+  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+  char key;
+  std::cin.get(key);
+
+  tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+  return key;
+}
 int main() {
   sf::Music song;
 
@@ -43,29 +64,29 @@ int main() {
   std::cout << "[p] Play [o] Pause [q] Quit [n] Next [b] Previous" << std::endl;
   ;
 
-  std::string command;
   bool is_running = true;
 
   while (is_running) {
-    std::cout << "-> ";
-    std::cin >> command;
 
-    if (command == "q") {
+    std::cout << "-> " << std::flush;
+    char command = getkey();
+
+    if (command == 'q') {
       std::cout << "Goodbye" << std::endl;
       is_running = false;
     }
 
-    else if (command == "p") {
+    else if (command == 'p') {
       song.play();
       std::cout << "The song is playing" << std::endl;
     }
 
-    else if (command == "o") {
+    else if (command == 'o') {
       song.pause();
       std::cout << "The song is paused" << std::endl;
     }
 
-    else if (command == "n") {
+    else if (command == 'n') {
       if (currentSong < playlist.size() - 1) {
         currentSong++; // currentSong = currentSong +  1
         song.stop();
@@ -83,7 +104,7 @@ int main() {
       }
     }
 
-    else if (command == "b") {
+    else if (command == 'b') {
       if (currentSong > 0) {
         currentSong--; // currentSong = currentSong - 1
 
