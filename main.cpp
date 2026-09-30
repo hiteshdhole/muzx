@@ -1,3 +1,5 @@
+#include "audio_player.hpp"
+#include "config.hpp"
 #include <SFML/Audio.hpp>
 #include <filesystem>
 #include <iostream>
@@ -19,19 +21,34 @@ char getkey() {
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
   char key;
-  std::cin.get(key);
+  read(STDIN_FILENO, &key, 1);
 
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 
   return key;
 }
 int main() {
-  sf::Music song;
+  audio_player player;
+
+  config settings;
+
+  std::string music_folder = settings.get_music_folder();
+
+  if (music_folder.empty()) {
+    std::cout << "Enter your music folder: ";
+    std::getline(std::cin, music_folder);
+
+    if (!settings.save_music_folder(music_folder)) {
+      std::cerr << "Error: Could not save music folder" << std::endl;
+      return 1;
+    }
+  }
 
   // Playlist
   std::vector<std::string> playlist;
 
-  for (const auto &file : std::filesystem::directory_iterator("music")) {
+  for (const auto &file :
+       std::filesystem::recursive_directory_iterator(music_folder)) {
     if (file.path().extension() == ".mp3") {
       playlist.push_back(file.path().string());
     }
@@ -46,7 +63,7 @@ int main() {
   std::size_t currentSong = 0;
 
   // Load first song
-  if (!song.openFromFile(playlist[currentSong])) {
+  if (!player.load(playlist[currentSong])) {
     std::cerr << "Error: Music cannot be loaded" << std::endl;
     return 1;
   }
@@ -77,24 +94,24 @@ int main() {
     }
 
     else if (command == 'p') {
-      song.play();
+      player.play();
       std::cout << "The song is playing" << std::endl;
     }
 
     else if (command == 'o') {
-      song.pause();
+      player.pause();
       std::cout << "The song is paused" << std::endl;
     }
 
     else if (command == 'n') {
       if (currentSong < playlist.size() - 1) {
         currentSong++; // currentSong = currentSong +  1
-        song.stop();
+        player.stop();
 
-        if (!song.openFromFile(playlist[currentSong])) {
+        if (!player.load(playlist[currentSong])) {
           std::cerr << "Error: Could not load next song" << std::endl;
         } else {
-          song.play();
+          player.play();
 
           std::cout << "Playing: " << playlist[currentSong] << '\n'
                     << std::endl;
@@ -108,13 +125,13 @@ int main() {
       if (currentSong > 0) {
         currentSong--; // currentSong = currentSong - 1
 
-        song.stop();
+        player.stop();
 
-        if (!song.openFromFile(playlist[currentSong])) {
+        if (!player.load(playlist[currentSong])) {
 
           std::cerr << "Error: Could not load previous song " << std::endl;
         } else {
-          song.play();
+          player.play();
 
           std::cout << "Playing: " << playlist[currentSong] << '\n'
                     << std::endl;
