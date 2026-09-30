@@ -32,13 +32,23 @@ bool playlist::next() {
   }
 
   if (shuffleMode) {
+    if (songs.size() == 1) {
+      return true;
+    }
+
     std::random_device rd;
     std::mt19937 generator(rd());
 
     std::uniform_int_distribution<std::size_t> distribution(0,
-                                                            songs.size() - 1);
+                                                            songs.size() - 2);
 
-    currentSong = distribution(generator);
+    std::size_t nextSong = distribution(generator);
+
+    if (nextSong >= currentSong) {
+      nextSong++;
+    }
+
+    currentSong = nextSong;
 
     return true;
   }

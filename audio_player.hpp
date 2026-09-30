@@ -14,6 +14,8 @@ public:
   void play();
   void pause();
   void stop();
+
+  bool isFinished() const;
 };
 
 #endif
