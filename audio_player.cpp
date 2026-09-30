@@ -16,3 +16,7 @@ void audio_player::play() { song.play(); }
 void audio_player::pause() { song.pause(); }
 
 void audio_player::stop() { song.stop(); }
+
+bool audio_player::isFinished() const {
+  return song.getStatus() == sf::Music::Status::Stopped;
+}
