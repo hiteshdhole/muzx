@@ -2,7 +2,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 
 std::string config::get_config_file() {
   const char *home = std::getenv("HOME");
@@ -54,27 +53,4 @@ bool config::save_music_folder(const std::string &folder) {
   file << folder << '\n';
 
   return true;
-}
-int main() {
-  config c;
-
-  std::string folder = c.get_music_folder();
-
-  if (folder.empty()) {
-    std::cout << "No music folder saved.\n";
-
-    std::cout << "Enter music folder: ";
-
-    std::getline(std::cin, folder);
-
-    if (c.save_music_folder(folder)) {
-      std::cout << "Music folder saved.\n";
-    } else {
-      std::cout << "Failed to save music folder.\n";
-    }
-  } else {
-    std::cout << "Saved music folder: " << folder << '\n';
-  }
-
-  return 0;
 }
