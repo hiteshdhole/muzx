@@ -88,5 +88,6 @@ std::string playlist::currentName() const {
 std::string playlist::songName(std::size_t index) const {
   return std::filesystem::path(songs[index]).filename().string();
 }
+std::size_t playlist::currentIndex() const { return currentSong; }
 
 const std::vector<std::string> &playlist::getSongs() const { return songs; }
