@@ -1,12 +1,10 @@
 #include "audio_player.hpp"
 #include "config.hpp"
-#include <SFML/Audio.hpp>
-#include <filesystem>
+#include "playlist.hpp"
 #include <iostream>
 #include <string>
 #include <termios.h>
 #include <unistd.h>
-#include <vector>
 
 char getkey() {
   termios oldt;
@@ -45,46 +43,38 @@ int main() {
   }
 
   // Playlist
-  std::vector<std::string> playlist;
+  playlist music_playlist;
 
-  for (const auto &file :
-       std::filesystem::recursive_directory_iterator(music_folder)) {
-    if (file.path().extension() == ".mp3") {
-      playlist.push_back(file.path().string());
-    }
-  }
-
-  if (playlist.empty()) {
-    std::cerr << "NO MP3 files found in the music folder " << std::endl;
+  if (!music_playlist.load(music_folder)) {
+    std::cerr << "NO MP3 files found in the selected music folder" << std::endl;
     return 1;
   }
 
   // Current song index
-  std::size_t currentSong = 0;
 
   // Load first song
-  if (!player.load(playlist[currentSong])) {
+  if (!player.load(music_playlist.current())) {
     std::cerr << "Error: Music cannot be loaded" << std::endl;
     return 1;
   }
   std::cout << " ================MUZX PLAYLIST==================" << std::endl;
 
-  for (std::size_t i = 0; i < playlist.size(); i++) {
-    std::cout << i + 1 << " . " << playlist[i] << std::endl;
+  for (std::size_t i = 0; i < music_playlist.getSongs().size(); i++) {
+    std::cout << i + 1 << " . " << music_playlist.getSongs()[i] << std::endl;
   }
 
   std::cout << "================================================" << std::endl;
-  std::cout << "The music loaded successfully" << playlist[currentSong]
+  std::cout << "The music loaded successfully" << music_playlist.current()
             << std::endl;
   std::cout << "Version    : 0.1 " << std::endl;
   std::cout << "Created by : Hitesh " << std::endl;
-  std::cout << "[p] Play [o] Pause [q] Quit [n] Next [b] Previous" << std::endl;
+  std::cout << "[p] Play [o] Pause [q] Quit [n] Next [b] Previous [s] Shuffle"
+            << std::endl;
   ;
 
   bool is_running = true;
 
   while (is_running) {
-
     std::cout << "-> " << std::flush;
     char command = getkey();
 
@@ -104,16 +94,15 @@ int main() {
     }
 
     else if (command == 'n') {
-      if (currentSong < playlist.size() - 1) {
-        currentSong++; // currentSong = currentSong +  1
+      if (music_playlist.next()) {
         player.stop();
 
-        if (!player.load(playlist[currentSong])) {
+        if (!player.load(music_playlist.current())) {
           std::cerr << "Error: Could not load next song" << std::endl;
         } else {
           player.play();
 
-          std::cout << "Playing: " << playlist[currentSong] << '\n'
+          std::cout << "Playing: " << music_playlist.current() << '\n'
                     << std::endl;
         }
       } else {
@@ -122,29 +111,39 @@ int main() {
     }
 
     else if (command == 'b') {
-      if (currentSong > 0) {
-        currentSong--; // currentSong = currentSong - 1
-
+      if (music_playlist.previous()) {
         player.stop();
 
-        if (!player.load(playlist[currentSong])) {
-
-          std::cerr << "Error: Could not load previous song " << std::endl;
+        if (!player.load(music_playlist.current())) {
+          std::cerr << "Error: Could not load previous song" << std::endl;
         } else {
           player.play();
 
-          std::cout << "Playing: " << playlist[currentSong] << '\n'
+          std::cout << "Playing: " << music_playlist.current() << '\n'
                     << std::endl;
         }
       } else {
         std::cout << "Already at the first song" << std::endl;
       }
-    }
+    } else if (command == 's') {
+      if (music_playlist.toggleShuffle()) {
+        std::cout << "Shuffle: ON" << std::endl;
 
-    else {
+        music_playlist.shuffle();
+
+        player.stop();
+
+        if (player.load(music_playlist.current())) {
+          player.play();
+
+          std::cout << "Playing: " << music_playlist.current() << std::endl;
+        }
+      } else {
+        std::cout << "Shuffle: OFF" << std::endl;
+      }
+    } else {
       std::cout << "Command error" << std::endl;
     }
   }
-
   return 0;
 }
