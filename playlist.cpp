@@ -82,5 +82,11 @@ bool playlist::toggleShuffle() {
 
   return shuffleMode;
 }
+std::string playlist::currentName() const {
+  return std::filesystem::path(songs[currentSong]).filename().string();
+}
+std::string playlist::songName(std::size_t index) const {
+  return std::filesystem::path(songs[index]).filename().string();
+}
 
 const std::vector<std::string> &playlist::getSongs() const { return songs; }

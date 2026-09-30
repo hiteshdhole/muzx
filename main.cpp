@@ -70,33 +70,40 @@ int main() {
     std::cerr << "Error: Music cannot be loaded" << std::endl;
     return 1;
   }
-  std::cout << " ================MUZX PLAYLIST==================" << std::endl;
+  std::cout << "================ MUZX PLAYLIST ================" << std::endl;
+
+  std::cout << "Now Playing: " << music_playlist.currentName() << std::endl;
+
+  std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
+            << music_playlist.getSongs().size() << std::endl;
+  std::cout << "================================================" << std::endl;
 
   for (std::size_t i = 0; i < music_playlist.getSongs().size(); i++) {
-    std::cout << i + 1 << " . " << music_playlist.getSongs()[i] << std::endl;
+    std::cout << i + 1 << ". " << music_playlist.songName(i) << std::endl;
   }
 
   std::cout << "================================================" << std::endl;
-  std::cout << "The music loaded successfully" << music_playlist.current()
-            << std::endl;
-  std::cout << "Version    : 0.1 " << std::endl;
-  std::cout << "Created by : Hitesh " << std::endl;
-  std::cout << "[p] Play [o] Pause [q] Quit [n] Next [b] Previous [s] Shuffle"
-            << std::endl;
-  ;
+
+  std::cout << "[p] Play  [o] Pause  [x] Stop  [n] Next  "
+            << "[b] Previous  [s] Shuffle  [q] Quit" << std::endl;
 
   bool is_running = true;
+  bool manuallyStopped = false;
   enableRawMode();
+
   while (is_running) {
-    if (player.isFinished()) {
+    if (player.isFinished() && !manuallyStopped) {
       if (music_playlist.next()) {
         player.stop();
 
         if (player.load(music_playlist.current())) {
           player.play();
 
-          std::cout << "\nAuto-playing: " << music_playlist.current()
+          std::cout << "\nAuto-playing: " << music_playlist.currentName()
                     << std::endl;
+
+          std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
+                    << music_playlist.getSongs().size() << std::endl;
         }
       } else {
         std::cout << "\nPlaylist finished." << std::endl;
@@ -105,8 +112,6 @@ int main() {
     }
 
     if (keyAvailable()) {
-      std::cout << "-> " << std::flush;
-
       char command = getkey();
 
       if (command == 'q') {
@@ -115,25 +120,39 @@ int main() {
       }
 
       else if (command == 'p') {
+        manuallyStopped = false;
         player.play();
+
         std::cout << "The song is playing" << std::endl;
       }
 
       else if (command == 'o') {
         player.pause();
+
         std::cout << "The song is paused" << std::endl;
+      }
+
+      else if (command == 'x') {
+        player.stop();
+        manuallyStopped = true;
+
+        std::cout << "Stopped: " << music_playlist.currentName() << std::endl;
       }
 
       else if (command == 'n') {
         if (music_playlist.next()) {
+          manuallyStopped = false;
           player.stop();
 
           if (!player.load(music_playlist.current())) {
             std::cerr << "Error: Could not load next song" << std::endl;
           } else {
             player.play();
+            std::cout << "Playing: " << music_playlist.currentName()
+                      << std::endl;
 
-            std::cout << "Playing: " << music_playlist.current() << '\n'
+            std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
+                      << music_playlist.getSongs().size() << "\n"
                       << std::endl;
           }
         } else {
@@ -143,6 +162,7 @@ int main() {
 
       else if (command == 'b') {
         if (music_playlist.previous()) {
+          manuallyStopped = false;
           player.stop();
 
           if (!player.load(music_playlist.current())) {
@@ -150,8 +170,11 @@ int main() {
           } else {
             player.play();
 
-            std::cout << "Playing: " << music_playlist.current() << '\n'
+            std::cout << "Playing: " << music_playlist.currentName()
                       << std::endl;
+
+            std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
+                      << music_playlist.getSongs().size() << std::endl;
           }
         } else {
           std::cout << "Already at the first song" << std::endl;
@@ -164,12 +187,14 @@ int main() {
 
           music_playlist.shuffle();
 
+          manuallyStopped = false;
           player.stop();
 
           if (player.load(music_playlist.current())) {
             player.play();
 
-            std::cout << "Playing: " << music_playlist.current() << std::endl;
+            std::cout << "Playing: " << music_playlist.currentName()
+                      << std::endl;
           }
         } else {
           std::cout << "Shuffle: OFF" << std::endl;
@@ -181,6 +206,8 @@ int main() {
       }
     }
   }
+
   disableRawMode();
+
   return 0;
 }
