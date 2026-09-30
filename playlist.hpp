@@ -12,13 +12,13 @@ private:
 
 public:
   playlist();
-
+  std::string songName(std::size_t index) const;
   bool load(const std::string &folder);
-
+  std::size_t currentIndex() const;
   bool empty() const;
 
   std::string current() const;
-
+  std::string currentName() const;
   bool next();
   bool previous();
 
