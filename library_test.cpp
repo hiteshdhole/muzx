@@ -97,10 +97,40 @@ void showQueue(queue &musicQueue) {
 
     if (isPlaying) {
       std::cout << "Status: Playing\n";
+
       std::cout << "Now Playing: "
                 << std::filesystem::path(musicQueue.song(playingIndex))
                        .filename()
                        .string()
+                << '\n';
+
+      int currentSeconds =
+          static_cast<int>(player.getPlayingOffset().asSeconds());
+
+      int totalSeconds = static_cast<int>(player.getDuration().asSeconds());
+
+      double progress = 0.0;
+
+      if (totalSeconds > 0) {
+        progress = static_cast<double>(currentSeconds) / totalSeconds;
+      }
+
+      const int barWidth = 20;
+      int filled = static_cast<int>(progress * barWidth);
+
+      std::cout << "Progress: [";
+
+      for (int i = 0; i < barWidth; i++) {
+        if (i < filled)
+          std::cout << '#';
+        else
+          std::cout << '-';
+      }
+
+      std::cout << "] " << currentSeconds / 60 << ":"
+                << (currentSeconds % 60 < 10 ? "0" : "") << currentSeconds % 60
+                << " / " << totalSeconds / 60 << ":"
+                << (totalSeconds % 60 < 10 ? "0" : "") << totalSeconds % 60
                 << '\n';
     } else if (isPaused) {
       std::cout << "Status: Paused\n";
