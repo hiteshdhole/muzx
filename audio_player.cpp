@@ -28,3 +28,29 @@ sf::Time audio_player::getPlayingOffset() const {
 }
 
 sf::Time audio_player::getDuration() const { return song.getDuration(); }
+
+void audio_player::increaseVolume() {
+  float volume = song.getVolume();
+
+  if (volume < 100.0f) {
+    volume += 10.0f;
+
+    if (volume > 100.0f)
+      volume = 100.0f;
+
+    song.setVolume(volume);
+  }
+}
+
+void audio_player::decreaseVolume() {
+  float volume = song.getVolume();
+
+  if (volume > 0.0f) {
+    volume -= 10.0f;
+
+    if (volume < 0.0f)
+      volume = 0.0f;
+
+    song.setVolume(volume);
+  }
+}
