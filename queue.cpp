@@ -8,8 +8,10 @@ std::size_t queue::size() const { return songs.size(); }
 
 std::string queue::front() const { return songs.front(); }
 
-void queue::remove() {
-  if (!songs.empty()) {
-    songs.erase(songs.begin());
+std::string queue::song(std::size_t index) const { return songs[index]; }
+
+void queue::remove(std::size_t index) {
+  if (index < songs.size()) {
+    songs.erase(songs.begin() + index);
   }
 }

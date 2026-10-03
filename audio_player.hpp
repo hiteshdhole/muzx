@@ -13,6 +13,7 @@ public:
 
   void play();
   void pause();
+  void resume();
   void stop();
 
   bool isFinished() const;
