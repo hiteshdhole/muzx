@@ -189,11 +189,17 @@ void showQueue(queue &musicQueue) {
           playingIndex = queueCursor.current();
 
           isPlaying = true;
+          isPaused = false;
         }
       }
     }
+    if (key == '+') {
+      player.increaseVolume();
+    }
 
-    else if (key == 'p') {
+    if (key == '_') {
+      player.decreaseVolume();
+    } else if (key == 'p') {
       player.pause();
       isPlaying = false;
       isPaused = true;
@@ -214,6 +220,7 @@ void showQueue(queue &musicQueue) {
         if (player.load(musicQueue.song(playingIndex))) {
           player.play();
           isPlaying = true;
+          isPaused = false;
         }
       }
     } else if (key == 'b') {
@@ -228,6 +235,7 @@ void showQueue(queue &musicQueue) {
         if (player.load(musicQueue.song(playingIndex))) {
           player.play();
           isPlaying = true;
+          isPaused = false;
         }
       }
     } else if (key == 'd') {
