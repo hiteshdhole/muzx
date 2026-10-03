@@ -17,6 +17,11 @@ public:
   void stop();
 
   bool isFinished() const;
+  sf::Time getPlayingOffset() const;
+  sf::Time getDuration() const;
+
+  void increaseVolume();
+  void decreaseVolume();
 };
 
 #endif
