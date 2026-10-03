@@ -15,7 +15,8 @@ public:
   std::size_t size() const;
 
   std::string front() const;
-  void remove();
+  std::string song(std::size_t index) const;
+  void remove(std::size_t index);
 };
 
 #endif

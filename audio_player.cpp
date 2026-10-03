@@ -14,7 +14,7 @@ bool audio_player::load(const std::string &filename) {
 void audio_player::play() { song.play(); }
 
 void audio_player::pause() { song.pause(); }
-
+void audio_player::resume() { song.play(); }
 void audio_player::stop() { song.stop(); }
 
 bool audio_player::isFinished() const {
