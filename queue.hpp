@@ -17,6 +17,8 @@ public:
   std::string front() const;
   std::string song(std::size_t index) const;
   void remove(std::size_t index);
+  void clear();
+  void save(const std::string &filename) const;
 };
 
 #endif

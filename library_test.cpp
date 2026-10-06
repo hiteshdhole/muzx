@@ -144,10 +144,12 @@ void showQueue(queue &musicQueue) {
     }
     std::cout << "Queue: " << musicQueue.size() << " songs\n";
 
+    std::cout << "Volume: " << static_cast<int>(player.getVolume()) << "%\n";
     std::cout << "--------------------------------\n";
 
-    std::cout << "[j/k] Move  [Enter] Play  [p] Pause  [r] Resume  [n] Next  "
-                 "[b] Previous  [d] Remove  [q] Back\n";
+    std::cout << "[j/k] Move  [Enter] Play  [p] Pause  [r] Resume  "
+                 "[n] Next  [b] Previous  [+/-] Volume  [d] Remove  [c] Clear "
+                 "Queue  [q] Back\n";
 
     // Check if current song finished
     if (isPlaying && player.isFinished()) {
@@ -258,6 +260,14 @@ void showQueue(queue &musicQueue) {
           queueCursor.moveUp(musicQueue.size());
         }
       }
+    } else if (key == 'c') {
+      player.stop();
+
+      musicQueue.clear();
+
+      isPlaying = false;
+      isPaused = false;
+      playingIndex = 0;
     } else if (key == 'q') {
       player.stop();
       break;
