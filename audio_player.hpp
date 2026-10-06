@@ -22,6 +22,8 @@ public:
 
   void increaseVolume();
   void decreaseVolume();
+
+  float getVolume() const;
 };
 
 #endif

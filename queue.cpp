@@ -15,3 +15,5 @@ void queue::remove(std::size_t index) {
     songs.erase(songs.begin() + index);
   }
 }
+
+void queue::clear() { songs.clear(); }

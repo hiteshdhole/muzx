@@ -54,3 +54,4 @@ void audio_player::decreaseVolume() {
     song.setVolume(volume);
   }
 }
+float audio_player::getVolume() const { return song.getVolume(); }
