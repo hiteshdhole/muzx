@@ -19,6 +19,7 @@ public:
   void remove(std::size_t index);
   void clear();
   void save(const std::string &filename) const;
+  void load(const std::string &filename);
 };
 
 #endif

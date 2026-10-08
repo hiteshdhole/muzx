@@ -1,6 +1,9 @@
 #include "audio_player.hpp"
 #include "config.hpp"
+#include "library.hpp"
 #include "playlist.hpp"
+#include "queue.hpp"
+#include "selection.hpp"
 #include <iostream>
 #include <string>
 #include <sys/select.h>
@@ -43,6 +46,10 @@ int main() {
 
   config settings;
 
+  library musicLibrary;
+  selection cursor;
+  queue musicQueue;
+
   std::string music_folder = settings.get_music_folder();
 
   if (music_folder.empty()) {
@@ -53,6 +60,11 @@ int main() {
       std::cerr << "Error: Could not save music folder" << std::endl;
       return 1;
     }
+  }
+
+  if (!musicLibrary.load(music_folder)) {
+    std::cerr << "No music folders found" << std::endl;
+    return 1;
   }
 
   // Playlist
