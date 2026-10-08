@@ -4,11 +4,13 @@
 #include "playlist.hpp"
 #include "queue.hpp"
 #include "selection.hpp"
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
+#include <vector>
 
 char getkey() {
   char key;
@@ -29,6 +31,77 @@ void disableRawMode() {
   tcgetattr(STDIN_FILENO, &terminal);
   terminal.c_lflag |= (ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
+}
+
+void showLibrary(const library &musicLibrary, const selection &cursor) {
+  std::cout << "\033[2J\033[H";
+
+  std::cout << "MUSIC LIBRARY\n\n";
+
+  for (std::size_t i = 0; i < musicLibrary.size(); i++) {
+    if (i == cursor.current()) {
+      std::cout << "> ";
+    } else {
+      std::cout << "  ";
+    }
+
+    std::cout << musicLibrary.itemName(i) << '\n';
+  }
+
+  std::cout << "\n[j/k] Move   [Enter] Open   [o] Queue   [q] Quit\n";
+}
+
+void showSongs(const std::string &folder, const std::string &folderName,
+               queue &musicQueue) {
+  std::vector<std::string> songs;
+
+  for (const auto &entry : std::filesystem::directory_iterator(folder)) {
+    if (entry.path().extension() == ".mp3") {
+      songs.push_back(entry.path().string());
+    }
+  }
+
+  selection songCursor;
+
+  while (true) {
+    std::cout << "\033[2J\033[H";
+
+    std::cout << folderName << "\n\n";
+
+    for (std::size_t i = 0; i < songs.size(); i++) {
+      if (i == songCursor.current()) {
+        std::cout << "> ";
+      } else {
+        std::cout << "  ";
+      }
+
+      std::cout << std::filesystem::path(songs[i]).filename().string() << '\n';
+    }
+
+    std::cout << "\n[j/k] Move   [Enter] Add to Queue   [q] Back\n";
+
+    char key = getkey();
+
+    if (key == 'j') {
+      songCursor.moveDown(songs.size());
+    } else if (key == 'k') {
+      songCursor.moveUp(songs.size());
+    } else if (key == '\n') {
+      if (!songs.empty()) {
+        musicQueue.add(songs[songCursor.current()]);
+
+        std::cout << "\nAdded to queue: "
+                  << std::filesystem::path(songs[songCursor.current()])
+                         .filename()
+                         .string()
+                  << '\n';
+
+        usleep(500000);
+      }
+    } else if (key == 'q') {
+      break;
+    }
+  }
 }
 bool keyAvailable() {
   timeval timeout;
@@ -74,6 +147,32 @@ int main() {
     std::cerr << "NO MP3 files found in the selected music folder" << std::endl;
     return 1;
   }
+
+  enableRawMode();
+
+  while (true) {
+    showLibrary(musicLibrary, cursor);
+
+    char key = getkey();
+
+    if (key == 'j') {
+      cursor.moveDown(musicLibrary.size());
+    } else if (key == 'k') {
+      cursor.moveUp(musicLibrary.size());
+    } else if (key == '\n') {
+      if (!musicLibrary.empty()) {
+        std::string folder = musicLibrary.item(cursor.current());
+
+        showSongs(folder, musicLibrary.itemName(cursor.current()), musicQueue);
+      }
+    } else if (key == 'q') {
+      break;
+    }
+  }
+
+  disableRawMode();
+
+  return 0;
 
   // Current song index
 
