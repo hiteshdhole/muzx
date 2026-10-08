@@ -1,9 +1,9 @@
 #include "audio_player.hpp"
 #include "config.hpp"
 #include "library.hpp"
-#include "playlist.hpp"
 #include "queue.hpp"
 #include "selection.hpp"
+
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -13,15 +13,31 @@
 #include <vector>
 
 char getkey() {
-  char key;
+  char key = '\0';
   read(STDIN_FILENO, &key, 1);
   return key;
 }
+
+bool keyAvailable() {
+  timeval timeout;
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 0;
+
+  fd_set readfds;
+
+  FD_ZERO(&readfds);
+  FD_SET(STDIN_FILENO, &readfds);
+
+  return select(STDIN_FILENO + 1, &readfds, nullptr, nullptr, &timeout) > 0;
+}
+
 void enableRawMode() {
   termios terminal;
 
   tcgetattr(STDIN_FILENO, &terminal);
+
   terminal.c_lflag &= ~(ICANON | ECHO);
+
   tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
 }
 
@@ -29,26 +45,32 @@ void disableRawMode() {
   termios terminal;
 
   tcgetattr(STDIN_FILENO, &terminal);
+
   terminal.c_lflag |= (ICANON | ECHO);
+
   tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
 }
 
 void showLibrary(const library &musicLibrary, const selection &cursor) {
   std::cout << "\033[2J\033[H";
 
-  std::cout << "MUSIC LIBRARY\n\n";
+  std::cout << "================ MUSIC LIBRARY ================\n\n";
 
-  for (std::size_t i = 0; i < musicLibrary.size(); i++) {
-    if (i == cursor.current()) {
-      std::cout << "> ";
-    } else {
-      std::cout << "  ";
+  if (musicLibrary.empty()) {
+    std::cout << "No folders found.\n";
+  } else {
+    for (std::size_t i = 0; i < musicLibrary.size(); i++) {
+      if (i == cursor.current()) {
+        std::cout << "> ";
+      } else {
+        std::cout << "  ";
+      }
+
+      std::cout << musicLibrary.itemName(i) << '\n';
     }
-
-    std::cout << musicLibrary.itemName(i) << '\n';
   }
 
-  std::cout << "\n[j/k] Move   [Enter] Open   [o] Queue   [q] Quit\n";
+  std::cout << "\n[j/k] Move  [Enter] Open  [o] Queue  [q] Quit\n";
 }
 
 void showSongs(const std::string &folder, const std::string &folderName,
@@ -66,19 +88,24 @@ void showSongs(const std::string &folder, const std::string &folderName,
   while (true) {
     std::cout << "\033[2J\033[H";
 
-    std::cout << folderName << "\n\n";
+    std::cout << "================ " << folderName << " ================\n\n";
 
-    for (std::size_t i = 0; i < songs.size(); i++) {
-      if (i == songCursor.current()) {
-        std::cout << "> ";
-      } else {
-        std::cout << "  ";
+    if (songs.empty()) {
+      std::cout << "No MP3 files found.\n";
+    } else {
+      for (std::size_t i = 0; i < songs.size(); i++) {
+        if (i == songCursor.current()) {
+          std::cout << "> ";
+        } else {
+          std::cout << "  ";
+        }
+
+        std::cout << std::filesystem::path(songs[i]).filename().string()
+                  << '\n';
       }
-
-      std::cout << std::filesystem::path(songs[i]).filename().string() << '\n';
     }
 
-    std::cout << "\n[j/k] Move   [Enter] Add to Queue   [q] Back\n";
+    std::cout << "\n[j/k] Move  [Enter] Add to Queue  [q] Back\n";
 
     char key = getkey();
 
@@ -88,35 +115,288 @@ void showSongs(const std::string &folder, const std::string &folderName,
       songCursor.moveUp(songs.size());
     } else if (key == '\n') {
       if (!songs.empty()) {
-        musicQueue.add(songs[songCursor.current()]);
+        std::string song = songs[songCursor.current()];
+
+        musicQueue.add(song);
 
         std::cout << "\nAdded to queue: "
-                  << std::filesystem::path(songs[songCursor.current()])
-                         .filename()
-                         .string()
-                  << '\n';
+                  << std::filesystem::path(song).filename().string() << '\n';
 
-        usleep(500000);
+        usleep(400000);
       }
     } else if (key == 'q') {
       break;
     }
   }
 }
-bool keyAvailable() {
-  timeval timeout;
-  timeout.tv_sec = 0;
-  timeout.tv_usec = 0;
 
-  fd_set readfds;
-  FD_ZERO(&readfds);
-  FD_SET(STDIN_FILENO, &readfds);
-
-  return select(STDIN_FILENO + 1, &readfds, nullptr, nullptr, &timeout) > 0;
-}
-int main() {
+void showQueue(queue &musicQueue) {
   audio_player player;
 
+  selection queueCursor;
+
+  bool isPlaying = false;
+  bool isPaused = false;
+
+  std::size_t playingIndex = 0;
+
+  while (true) {
+    std::cout << "\033[2J\033[H";
+
+    std::cout << "================ QUEUE ================\n\n";
+
+    if (musicQueue.empty()) {
+      std::cout << "Queue is empty\n";
+    } else {
+      for (std::size_t i = 0; i < musicQueue.size(); i++) {
+        if (i == queueCursor.current()) {
+          std::cout << "> ";
+        } else {
+          std::cout << "  ";
+        }
+
+        std::cout
+            << std::filesystem::path(musicQueue.song(i)).filename().string();
+
+        if (isPlaying && i == playingIndex) {
+          std::cout << " [PLAYING]";
+        }
+
+        else if (isPaused && i == playingIndex) {
+          std::cout << " [PAUSED]";
+        }
+
+        std::cout << '\n';
+      }
+    }
+
+    std::cout << "\n----------------------------------------\n";
+
+    if (isPlaying || isPaused) {
+      if (isPlaying) {
+        std::cout << "Status: Playing\n";
+      } else {
+        std::cout << "Status: Paused\n";
+      }
+
+      if (playingIndex < musicQueue.size()) {
+        std::cout << "Now Playing: "
+                  << std::filesystem::path(musicQueue.song(playingIndex))
+                         .filename()
+                         .string()
+                  << '\n';
+
+        int currentSeconds =
+            static_cast<int>(player.getPlayingOffset().asSeconds());
+
+        int totalSeconds = static_cast<int>(player.getDuration().asSeconds());
+
+        double progress = 0.0;
+
+        if (totalSeconds > 0) {
+          progress = static_cast<double>(currentSeconds) / totalSeconds;
+        }
+
+        const int barWidth = 20;
+
+        int filled = static_cast<int>(progress * barWidth);
+
+        std::cout << "Progress: [";
+
+        for (int i = 0; i < barWidth; i++) {
+          if (i < filled) {
+            std::cout << '#';
+          } else {
+            std::cout << '-';
+          }
+        }
+
+        std::cout << "] " << currentSeconds / 60 << ":"
+                  << (currentSeconds % 60 < 10 ? "0" : "")
+                  << currentSeconds % 60 << " / " << totalSeconds / 60 << ":"
+                  << (totalSeconds % 60 < 10 ? "0" : "") << totalSeconds % 60
+                  << '\n';
+      }
+    } else {
+      std::cout << "Status: Stopped\n";
+    }
+
+    std::cout << "Queue: " << musicQueue.size() << " songs\n";
+
+    std::cout << "Volume: " << static_cast<int>(player.getVolume()) << "%\n";
+
+    std::cout << "----------------------------------------\n";
+
+    std::cout << "[j/k] Move  "
+                 "[Enter] Play  "
+                 "[p] Pause  "
+                 "[r] Resume  "
+                 "[n] Next  "
+                 "[b] Previous\n";
+
+    std::cout << "[+/-] Volume  "
+                 "[d] Remove  "
+                 "[c] Clear Queue  "
+                 "[q] Back\n";
+
+    // Automatic next song
+    if (isPlaying && player.isFinished()) {
+      if (playingIndex + 1 < musicQueue.size()) {
+        playingIndex++;
+
+        player.stop();
+
+        if (player.load(musicQueue.song(playingIndex))) {
+          player.play();
+
+          isPlaying = true;
+          isPaused = false;
+        }
+      } else {
+        isPlaying = false;
+        isPaused = false;
+      }
+    }
+
+    // Wait for keyboard input
+    if (!keyAvailable()) {
+      usleep(10000);
+      continue;
+    }
+
+    char key = getkey();
+
+    if (key == 'j') {
+      queueCursor.moveDown(musicQueue.size());
+    }
+
+    else if (key == 'k') {
+      queueCursor.moveUp(musicQueue.size());
+    }
+
+    else if (key == '\n') {
+      if (!musicQueue.empty()) {
+        std::size_t selected = queueCursor.current();
+
+        player.stop();
+
+        if (player.load(musicQueue.song(selected))) {
+          player.play();
+
+          playingIndex = selected;
+
+          isPlaying = true;
+          isPaused = false;
+        }
+      }
+    }
+
+    else if (key == 'p') {
+      if (isPlaying) {
+        player.pause();
+
+        isPlaying = false;
+        isPaused = true;
+      }
+    }
+
+    else if (key == 'r') {
+      if (isPaused) {
+        player.resume();
+
+        isPlaying = true;
+        isPaused = false;
+      }
+    }
+
+    else if (key == 'n') {
+      if (!musicQueue.empty() && playingIndex + 1 < musicQueue.size()) {
+        player.stop();
+
+        playingIndex++;
+
+        if (player.load(musicQueue.song(playingIndex))) {
+          player.play();
+
+          isPlaying = true;
+          isPaused = false;
+        }
+      }
+    }
+
+    else if (key == 'b') {
+      if (!musicQueue.empty() && playingIndex > 0) {
+        player.stop();
+
+        playingIndex--;
+
+        if (player.load(musicQueue.song(playingIndex))) {
+          player.play();
+
+          isPlaying = true;
+          isPaused = false;
+        }
+      }
+    }
+
+    else if (key == '+') {
+      player.increaseVolume();
+    }
+
+    else if (key == '-') {
+      player.decreaseVolume();
+    }
+
+    else if (key == 'd') {
+      if (!musicQueue.empty()) {
+        std::size_t removedIndex = queueCursor.current();
+
+        if ((isPlaying || isPaused) && removedIndex == playingIndex) {
+          player.stop();
+
+          isPlaying = false;
+          isPaused = false;
+        }
+
+        musicQueue.remove(removedIndex);
+
+        if (removedIndex < playingIndex && (isPlaying || isPaused)) {
+          playingIndex--;
+        }
+
+        if (!musicQueue.empty() && queueCursor.current() >= musicQueue.size()) {
+          queueCursor.moveUp(musicQueue.size());
+        }
+
+        if (musicQueue.empty()) {
+          isPlaying = false;
+          isPaused = false;
+          playingIndex = 0;
+        }
+      }
+    }
+
+    else if (key == 'c') {
+      player.stop();
+
+      musicQueue.clear();
+
+      isPlaying = false;
+      isPaused = false;
+      playingIndex = 0;
+    }
+
+    else if (key == 'q') {
+      player.stop();
+
+      musicQueue.save("queue.txt");
+
+      break;
+    }
+  }
+}
+
+int main() {
   config settings;
 
   library musicLibrary;
@@ -126,27 +406,26 @@ int main() {
   std::string music_folder = settings.get_music_folder();
 
   if (music_folder.empty()) {
+    disableRawMode();
+
     std::cout << "Enter your music folder: ";
+
     std::getline(std::cin, music_folder);
 
     if (!settings.save_music_folder(music_folder)) {
-      std::cerr << "Error: Could not save music folder" << std::endl;
+      std::cerr << "Error: Could not save music folder\n";
+
       return 1;
     }
   }
 
   if (!musicLibrary.load(music_folder)) {
-    std::cerr << "No music folders found" << std::endl;
+    std::cerr << "No music folders found\n";
+
     return 1;
   }
 
-  // Playlist
-  playlist music_playlist;
-
-  if (!music_playlist.load(music_folder)) {
-    std::cerr << "NO MP3 files found in the selected music folder" << std::endl;
-    return 1;
-  }
+  musicQueue.load("queue.txt");
 
   enableRawMode();
 
@@ -157,164 +436,27 @@ int main() {
 
     if (key == 'j') {
       cursor.moveDown(musicLibrary.size());
-    } else if (key == 'k') {
+    }
+
+    else if (key == 'k') {
       cursor.moveUp(musicLibrary.size());
-    } else if (key == '\n') {
+    }
+
+    else if (key == '\n') {
       if (!musicLibrary.empty()) {
         std::string folder = musicLibrary.item(cursor.current());
 
         showSongs(folder, musicLibrary.itemName(cursor.current()), musicQueue);
       }
-    } else if (key == 'q') {
+    }
+
+    else if (key == 'o') {
+      showQueue(musicQueue);
+    }
+
+    else if (key == 'q') {
+      musicQueue.save("queue.txt");
       break;
-    }
-  }
-
-  disableRawMode();
-
-  return 0;
-
-  // Current song index
-
-  // Load first song
-  if (!player.load(music_playlist.current())) {
-    std::cerr << "Error: Music cannot be loaded" << std::endl;
-    return 1;
-  }
-  std::cout << "================ MUZX PLAYLIST ================" << std::endl;
-
-  std::cout << "Now Playing: " << music_playlist.currentName() << std::endl;
-
-  std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
-            << music_playlist.getSongs().size() << std::endl;
-  std::cout << "================================================" << std::endl;
-
-  for (std::size_t i = 0; i < music_playlist.getSongs().size(); i++) {
-    std::cout << i + 1 << ". " << music_playlist.songName(i) << std::endl;
-  }
-
-  std::cout << "================================================" << std::endl;
-
-  std::cout << "[p] Play  [o] Pause  [x] Stop  [n] Next  "
-            << "[b] Previous  [s] Shuffle  [q] Quit" << std::endl;
-
-  bool is_running = true;
-  bool manuallyStopped = false;
-  enableRawMode();
-
-  while (is_running) {
-    if (player.isFinished() && !manuallyStopped) {
-      if (music_playlist.next()) {
-        player.stop();
-
-        if (player.load(music_playlist.current())) {
-          player.play();
-
-          std::cout << "\nAuto-playing: " << music_playlist.currentName()
-                    << std::endl;
-
-          std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
-                    << music_playlist.getSongs().size() << std::endl;
-        }
-      } else {
-        std::cout << "\nPlaylist finished." << std::endl;
-        is_running = false;
-      }
-    }
-
-    if (keyAvailable()) {
-      char command = getkey();
-
-      if (command == 'q') {
-        std::cout << "Goodbye" << std::endl;
-        is_running = false;
-      }
-
-      else if (command == 'p') {
-        manuallyStopped = false;
-        player.play();
-
-        std::cout << "The song is playing" << std::endl;
-      }
-
-      else if (command == 'o') {
-        player.pause();
-
-        std::cout << "The song is paused" << std::endl;
-      }
-
-      else if (command == 'x') {
-        player.stop();
-        manuallyStopped = true;
-
-        std::cout << "Stopped: " << music_playlist.currentName() << std::endl;
-      }
-
-      else if (command == 'n') {
-        if (music_playlist.next()) {
-          manuallyStopped = false;
-          player.stop();
-
-          if (!player.load(music_playlist.current())) {
-            std::cerr << "Error: Could not load next song" << std::endl;
-          } else {
-            player.play();
-            std::cout << "Playing: " << music_playlist.currentName()
-                      << std::endl;
-
-            std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
-                      << music_playlist.getSongs().size() << "\n"
-                      << std::endl;
-          }
-        } else {
-          std::cout << "Already at the last song" << std::endl;
-        }
-      }
-
-      else if (command == 'b') {
-        if (music_playlist.previous()) {
-          manuallyStopped = false;
-          player.stop();
-
-          if (!player.load(music_playlist.current())) {
-            std::cerr << "Error: Could not load previous song" << std::endl;
-          } else {
-            player.play();
-
-            std::cout << "Playing: " << music_playlist.currentName()
-                      << std::endl;
-
-            std::cout << "Track: " << music_playlist.currentIndex() + 1 << " / "
-                      << music_playlist.getSongs().size() << std::endl;
-          }
-        } else {
-          std::cout << "Already at the first song" << std::endl;
-        }
-      }
-
-      else if (command == 's') {
-        if (music_playlist.toggleShuffle()) {
-          std::cout << "Shuffle: ON" << std::endl;
-
-          music_playlist.shuffle();
-
-          manuallyStopped = false;
-          player.stop();
-
-          if (player.load(music_playlist.current())) {
-            player.play();
-
-            std::cout << "Playing: " << music_playlist.currentName()
-                      << std::endl;
-          }
-        } else {
-          std::cout << "Shuffle: OFF" << std::endl;
-        }
-      }
-
-      else {
-        std::cout << "Command error" << std::endl;
-      }
     }
   }
 
