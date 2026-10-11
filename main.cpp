@@ -84,7 +84,7 @@ void showTabs(AppTab active) {
       std::cout << names[i] << "  ";
   }
 
-  std::cout << "\n---------------------------------------------\n\n";
+  std::cout << "\n----------------------------------------------\n\n";
 }
 void showLibrary(const library &musicLibrary, const selection &cursor) {
   std::cout << "\033[2J\033[H";
