@@ -1,5 +1,6 @@
 #include "audio_player.hpp"
 #include "config.hpp"
+#include "cover.hpp"
 #include "queue.hpp"
 #include "selection.hpp"
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
@@ -22,15 +24,13 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// ANSI Color Codes for UI styling
 constexpr const char *kReset = "\033[0m";
-constexpr const char *kSelected = "\033[7m";      // Reverse video
-constexpr const char *kMuted = "\033[90m";        // Gray text
-constexpr const char *kPurpleBold = "\033[1;35m"; // Bold Purple text
-constexpr const char *kPink = "\033[95m";         // Bright Pink text
-constexpr const char *kGreenBold = "\033[1;32m";  // Bold Green for selection
+constexpr const char *kSelected = "\033[7m";
+constexpr const char *kMuted = "\033[90m";
+constexpr const char *kPurpleBold = "\033[1;35m";
+constexpr const char *kPink = "\033[95m";
+constexpr const char *kGreenBold = "\033[1;32m";
 
-// Key codes above 255 represent terminal escape-sequence keys.
 enum Key : int {
   KeyNone = 0,
   KeyEscape = 256,
@@ -42,10 +42,6 @@ enum Key : int {
   KeyEnter,
   KeyBackspace
 };
-
-// --------------------------------------------------
-// Terminal input & Lifecycle
-// --------------------------------------------------
 
 termios originalTerminal{};
 bool rawModeEnabled = false;
@@ -79,6 +75,7 @@ public:
     std::cout << "\033[?1049h\033[?25l\033[2J\033[H" << std::flush;
   }
   ~TerminalSession() {
+    clearTerminalCover();
     disableRawMode();
     std::cout << "\033[?25h\033[?1049l" << std::flush;
   }
@@ -136,10 +133,6 @@ int readKey() {
     return KeyNone;
   }
 }
-
-// --------------------------------------------------
-// File helpers
-// --------------------------------------------------
 
 std::string lowerCase(std::string value) {
   std::transform(
@@ -245,10 +238,6 @@ std::string fileName(const std::string &path) {
   return fs::path(path).filename().string();
 }
 
-// --------------------------------------------------
-// Application state
-// --------------------------------------------------
-
 enum class AppTab {
   Player = 0,
   Folders = 1,
@@ -276,17 +265,13 @@ struct AppState {
   bool playbackRunning = false;
   bool paused = false;
   bool shuffle = false;
+  bool showAlbumArt = false;
   std::mt19937 rng{std::random_device{}()};
 };
 
-// Returns total selectable rows in Folders (includes "[PLAY ALL]" at index 0)
 std::size_t folderMenuSize(const AppState &app) {
   return app.folderEntries.empty() ? 0 : app.folderEntries.size() + 1;
 }
-
-// --------------------------------------------------
-// Playback
-// --------------------------------------------------
 
 bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
                       std::size_t index, bool switchToPlayer = true) {
@@ -294,25 +279,40 @@ bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
     return false;
 
   std::vector<std::string> newPlaylist = songs;
-  const std::string path = newPlaylist[index];
+  std::size_t currentIndex = index;
+  bool loadedSuccessfully = false;
 
-  app.player.stop();
-  if (!app.player.load(path)) {
+  for (std::size_t attempts = 0; attempts < newPlaylist.size(); ++attempts) {
+    const std::string path = newPlaylist[currentIndex];
+    app.player.stop();
+
+    try {
+      if (app.player.load(path)) {
+        app.player.play();
+        app.playlist = std::move(newPlaylist);
+        app.playlistIndex = currentIndex;
+        app.currentSong = path;
+        app.hasCurrentSong = true;
+        app.playbackRunning = true;
+        app.paused = false;
+        if (switchToPlayer)
+          app.tab = AppTab::Player;
+        loadedSuccessfully = true;
+        break;
+      }
+    } catch (...) {
+    }
+
+    currentIndex = (currentIndex + 1) % newPlaylist.size();
+  }
+
+  if (!loadedSuccessfully) {
     app.hasCurrentSong = false;
     app.playbackRunning = false;
     app.paused = false;
     return false;
   }
 
-  app.playlist = std::move(newPlaylist);
-  app.playlistIndex = index;
-  app.currentSong = path;
-  app.player.play();
-  app.hasCurrentSong = true;
-  app.playbackRunning = true;
-  app.paused = false;
-  if (switchToPlayer)
-    app.tab = AppTab::Player;
   return true;
 }
 
@@ -411,10 +411,6 @@ void seekRight(AppState &app) {
   app.player.seekForward(5.0F);
 }
 
-// --------------------------------------------------
-// Queue helpers
-// --------------------------------------------------
-
 std::vector<std::string> queueAsList(const queue &songQueue) {
   std::vector<std::string> songs;
   for (std::size_t i = 0; i < songQueue.size(); ++i)
@@ -435,11 +431,8 @@ void addToQueue(AppState &app, const fs::path &path) {
   }
 }
 
-// --------------------------------------------------
-// Search prompt
-// --------------------------------------------------
-
 void askSearchQuery(AppState &app) {
+  clearTerminalCover();
   disableRawMode();
   std::cout << "\033[?25h\033[2J\033[H";
   std::cout << kPurpleBold << "Search songs by filename: " << kReset;
@@ -453,9 +446,14 @@ void askSearchQuery(AppState &app) {
   enableRawMode();
 }
 
-// --------------------------------------------------
-// UI helpers
-// --------------------------------------------------
+std::size_t visualLength(const std::string &text) {
+  std::size_t length = 0;
+  for (unsigned char c : text) {
+    if ((c & 0xC0) != 0x80)
+      ++length;
+  }
+  return length;
+}
 
 void showTabs(AppTab active) {
   std::cout << kPurpleBold << "MUZX  " << kReset;
@@ -482,7 +480,7 @@ void drawList(const std::vector<std::string> &labels,
   if (selectedIndex >= labels.size())
     selectedIndex = labels.size() - 1;
 
-  constexpr std::size_t visibleRows = 16;
+  constexpr std::size_t visibleRows = 14;
   std::size_t start = 0;
   if (selectedIndex >= visibleRows)
     start = selectedIndex - visibleRows + 1;
@@ -504,11 +502,18 @@ void drawList(const std::vector<std::string> &labels,
 }
 
 void drawPlayer(const AppState &app) {
-  std::cout << "\n" << kPurpleBold << "PLAYER" << kReset << "\n\n";
+  // Row 3 (0-indexed): PLAYER header, followed by 1 empty line (Row 4)
+  std::cout << kPurpleBold << "PLAYER" << kReset << "\n\n";
+
+  // Rows 5..14 (0-indexed): 10 rows reserved for Album Art
+  if (app.showAlbumArt && app.hasCurrentSong) {
+    renderPlayerCover(app.currentSong, app.showAlbumArt,
+                      app.tab == AppTab::Player);
+  }
 
   if (!app.hasCurrentSong) {
     std::cout << kMuted
-              << "  No song selected. Press Space or P to play all folders.\n"
+              << "  No track loaded. Press Space or P to play all folders.\n"
               << kReset;
   } else {
     float duration = app.player.getDuration().asSeconds();
@@ -540,7 +545,7 @@ void drawPlayer(const AppState &app) {
             ? static_cast<int>((static_cast<float>(percent) / 100) * width)
             : 0;
 
-    std::cout << "\n  [";
+    std::cout << "  [";
     for (int i = 0; i < width; ++i)
       std::cout << (i < filled ? '#' : '-');
     std::cout << "] " << percent << "%\n";
@@ -557,33 +562,32 @@ void drawPlayer(const AppState &app) {
     };
 
     std::cout << "  Time:    " << formatTime(position) << " / "
-              << formatTime(duration) << "\n";
-    std::cout << "  Volume:  " << app.player.getVolume() << "%\n";
+              << formatTime(duration)
+              << "   |   Volume: " << app.player.getVolume() << "%\n";
     std::cout << "  Shuffle: "
               << (app.shuffle ? std::string(kGreenBold) + "ON"
                               : std::string(kMuted) + "OFF")
-              << kReset << "\n";
-
+              << kReset;
     if (!app.playlist.empty())
-      std::cout << "  Track:   " << (app.playlistIndex + 1) << " / "
-                << app.playlist.size() << "\n";
+      std::cout << "          |   Track:  " << (app.playlistIndex + 1) << " / "
+                << app.playlist.size();
+    std::cout << "\n";
   }
 
   std::cout << kMuted
-            << "\nControls: Space play/pause | h/l or b/n prev/next | "
-               "Left/Right seek 5s\n";
-  std::cout << "          s shuffle | P play all folders | x stop | +/- volume "
-               "| e queue\n"
+            << "  Space Play/Pause  |  ←/→ Seek 5s  |  h/l Prev/Next  |  s "
+               "Shuffle  |  i Art ("
+            << (app.showAlbumArt ? "ON" : "OFF") << ")\n"
             << kReset;
 }
 
 void drawFolders(const AppState &app) {
-  std::cout << "\n" << kPurpleBold << "FOLDERS" << kReset << "\n";
-  std::cout << "  Current: " << kPink << app.browseFolder.string() << kReset
+  std::cout << kPurpleBold << "FOLDERS" << kReset << "\n";
+  std::cout << "  Path: " << kPink << app.browseFolder.string() << kReset
             << "\n";
   std::cout << kMuted
-            << "  Backspace: parent | l/Enter: open/play | p: play folder | P: "
-               "play all | e: queue\n\n"
+            << "  j/k Move  |  l/Enter Open/Play  |  Backspace Parent  |  p "
+               "Play Folder  |  e Queue\n\n"
             << kReset;
 
   std::vector<std::string> labels;
@@ -604,13 +608,12 @@ void drawFolders(const AppState &app) {
 }
 
 void drawQueue(const AppState &app) {
-  std::cout << "\n"
-            << kPurpleBold << "QUEUE" << kReset << "  (" << app.songQueue.size()
+  std::cout << kPurpleBold << "QUEUE" << kReset << "  (" << app.songQueue.size()
             << " songs)\n";
-  std::cout
-      << kMuted
-      << "  Enter: play selected | r: remove selected | c: clear Queue\n\n"
-      << kReset;
+  std::cout << kMuted
+            << "  j/k Move  |  Enter Play Selected  |  r Remove Selected  |  c "
+               "Clear Queue\n\n"
+            << kReset;
 
   std::vector<std::string> labels;
   for (std::size_t i = 0; i < app.songQueue.size(); ++i)
@@ -619,14 +622,14 @@ void drawQueue(const AppState &app) {
 }
 
 void drawSearch(const AppState &app) {
-  std::cout << "\n" << kPurpleBold << "SEARCH" << kReset << "\n";
+  std::cout << kPurpleBold << "SEARCH" << kReset << "\n";
   std::cout << "  Query: " << kPink
             << (app.searchQuery.empty() ? "(press / to search)"
                                         : app.searchQuery)
             << kReset << "\n";
   std::cout << kMuted
-            << "  /: search | j/k: navigate | Enter: play selected | e: add to "
-               "Queue\n\n"
+            << "  / Search  |  j/k Navigate Results  |  Enter Play Selected  | "
+               " e Add to Queue\n\n"
             << kReset;
 
   std::vector<std::string> labels;
@@ -637,37 +640,56 @@ void drawSearch(const AppState &app) {
 }
 
 void drawKeybindings() {
-  std::cout << "\n" << kPurpleBold << "KEYBINDINGS" << kReset << "\n\n";
-  auto row = [](const char *key, const char *action) {
-    std::cout << "  " << kPink << key << kReset << "\r\033[22C" << action
-              << "\n";
+  constexpr std::size_t kColumnWidth = 20;
+
+  auto section = [](const char *title) {
+    std::cout << "  " << kMuted << title << kReset << "\n";
   };
 
+  auto row = [](const std::string &key, const char *action) {
+    const std::size_t len = visualLength(key);
+    const std::size_t pad = len < kColumnWidth ? kColumnWidth - len : 1;
+    std::cout << "    " << kPink << key << kReset << std::string(pad, ' ')
+              << action << "\n";
+  };
+
+  std::cout << kPurpleBold << "KEYBINDINGS" << kReset << "\n\n";
+
+  section("PLAYBACK");
   row("Space", "Play / pause");
-  row("Left / Right", "Seek 5 seconds backward / forward");
+  row("← / →  or  a / d", "Seek 5 seconds backward / forward");
   row("h / l", "Previous / next song on Player");
+  row("n / b", "Next / previous song (global)");
   row("s", "Toggle shuffle");
-  row("n / b", "Next / previous");
-  row("Tab / Shift+Tab", "Change tabs");
-  row("Backspace", "Parent folder");
-  row("l / Enter", "Open folder / play selected item");
-  row("p (in Folders)", "Play all songs in selected / current folder");
-  row("P (Shift+P)", "Play all songs across all folders");
+  row("i", "Toggle album art (default hidden)");
+  row("+ / -", "Adjust volume");
+  row("x", "Stop playback");
+
+  std::cout << "\n";
+  section("NAVIGATION & FOLDERS");
+  row("Tab / Shift+Tab", "Change tabs (or 1-5)");
+  row("j / k  or  ↑ / ↓", "Navigate lists");
+  row("l / Enter", "Open folder / play selected song");
+  row("Backspace / h", "Parent folder");
+  row("p / P", "Play selected folder / Play all folders");
+
+  std::cout << "\n";
+  section("QUEUE & SEARCH");
   row("e", "Add song or folder to Queue");
   row("r", "Remove selected Queue item");
   row("c", "Clear Queue");
-  row("j / k", "Navigate Search / Folder / Queue results");
+  row("/", "Search songs by filename");
   row("Enter", "Play selected Search / Queue item");
-  row("x", "Stop");
-  row("q / Esc", "Quit");
+  row("q / Esc", "Quit MUZX");
 }
 
 void drawScreen(const AppState &app) {
   std::ostringstream frame;
   std::streambuf *terminalBuffer = std::cout.rdbuf(frame.rdbuf());
 
+  // Row 0: Title, Row 1: Tabs, Row 2: Separator
   std::cout << kPurpleBold << "M U Z X" << kReset
-            << "  |  Terminal Music Player\n\n";
+            << "  |  Terminal Music Player\n";
   showTabs(app.tab);
 
   switch (app.tab) {
@@ -688,40 +710,52 @@ void drawScreen(const AppState &app) {
     break;
   }
 
-  std::cout
-      << kMuted
-      << "\n------------------------------------------------------------\n"
-      << "  Tab/Shift+Tab Change Tabs | Space Play/Pause | s Shuffle | q/Esc "
-         "Quit\n"
-      << kReset;
+  std::cout << kMuted
+            << "------------------------------------------------------------\n"
+            << "  Tab/Shift+Tab Tabs  |  Space Play/Pause  |  i Art Toggle  |  "
+               "q/Esc Quit"
+            << kReset;
   std::cout.flush();
   std::cout.rdbuf(terminalBuffer);
+
+  winsize w{};
+  int maxRows = 24;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row > 1) {
+    maxRows = static_cast<int>(w.ws_row);
+  }
 
   const std::string content = frame.str();
   std::string output = "\033[H";
 
   std::size_t start = 0;
-  while (start < content.size()) {
+  int rowCount = 0;
+  while (start < content.size() && rowCount < maxRows) {
     std::size_t end = content.find('\n', start);
+    ++rowCount;
+
     if (end == std::string::npos) {
       output.append(content, start, std::string::npos);
-      output += "\033[K\n";
+      output += "\033[K";
       break;
     }
+
     output.append(content, start, end - start);
-    output += "\033[K\n";
+    output += "\033[K";
+    // Never print a newline on the last row of the terminal so it cannot scroll
+    if (rowCount < maxRows) {
+      output += "\n";
+    }
     start = end + 1;
   }
 
   output += "\033[J";
   std::cout << output << std::flush;
+
+  drawConfirmedKittyCover(app.hasCurrentSong ? app.currentSong : "",
+                          app.showAlbumArt, app.tab == AppTab::Player);
 }
 
 } // namespace
-
-// --------------------------------------------------
-// Main
-// --------------------------------------------------
 
 int main() {
   config settings;
@@ -769,7 +803,6 @@ int main() {
     if (key == KeyNone)
       continue;
 
-    // Tab switching: 1-5, Tab, Shift+Tab
     if (key >= '1' && key <= '5') {
       app.tab = static_cast<AppTab>(key - '1');
       continue;
@@ -783,7 +816,6 @@ int main() {
       continue;
     }
 
-    // Global controls
     if (key == 'q' || key == KeyEscape) {
       running = false;
       continue;
@@ -800,6 +832,10 @@ int main() {
       app.shuffle = !app.shuffle;
       continue;
     }
+    if (key == 'i') {
+      app.showAlbumArt = !app.showAlbumArt;
+      continue;
+    }
     if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
       nextSong(app);
       continue;
@@ -808,11 +844,11 @@ int main() {
       previousSong(app);
       continue;
     }
-    if (key == KeyLeft) {
+    if (key == KeyLeft || key == 'a') {
       seekLeft(app);
       continue;
     }
-    if (key == KeyRight) {
+    if (key == KeyRight || key == 'd') {
       seekRight(app);
       continue;
     }
@@ -835,7 +871,6 @@ int main() {
       continue;
     }
 
-    // List navigation (j / k / Up / Down)
     if (key == 'j' || key == KeyDown) {
       if (app.tab == AppTab::Folders && !app.folderEntries.empty())
         app.folderCursor.moveDown(folderMenuSize(app));
@@ -855,7 +890,6 @@ int main() {
       continue;
     }
 
-    // Tab-specific controls
     if (app.tab == AppTab::Folders) {
       if (key == KeyBackspace || key == 'h') {
         if (app.browseFolder != app.musicRoot) {
@@ -873,7 +907,7 @@ int main() {
             playFolder(app, app.browseFolder, true);
           }
         }
-      } else if (key == 'e' || key == 'a') {
+      } else if (key == 'e') {
         if (!app.folderEntries.empty()) {
           std::size_t index = app.folderCursor.current();
           if (index == 0) {
@@ -882,7 +916,7 @@ int main() {
             addToQueue(app, app.folderEntries[index - 1]);
           }
         }
-      } else if (key == 'l' || key == KeyEnter) {
+      } else if (key == KeyEnter || key == 'l') {
         if (!app.folderEntries.empty()) {
           std::size_t index = app.folderCursor.current();
           if (index == 0) {
@@ -914,7 +948,7 @@ int main() {
           playFromPlaylist(app, queueAsList(app.songQueue), index);
       }
     } else if (app.tab == AppTab::Search) {
-      if ((key == 'e' || key == 'a') && !app.searchResults.empty()) {
+      if (key == 'e' && !app.searchResults.empty()) {
         std::size_t index = app.searchCursor.current();
         if (index < app.searchResults.size())
           addToQueue(app, app.searchResults[index]);
@@ -924,13 +958,14 @@ int main() {
           playSongFromFolder(app, app.searchResults[index]);
       }
     } else if (app.tab == AppTab::Player) {
-      if ((key == 'e' || key == 'a') && app.hasCurrentSong)
+      if (key == 'e' && app.hasCurrentSong)
         addToQueue(app, app.currentSong);
     }
 
     app.songQueue.save(queueFile.string());
   }
 
+  clearTerminalCover();
   app.player.stop();
   app.songQueue.save(queueFile.string());
   return 0;
