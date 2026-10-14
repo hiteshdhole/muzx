@@ -72,12 +72,14 @@ class TerminalSession {
 public:
   TerminalSession() {
     enableRawMode();
-    std::cout << "\033[?1049h\033[?25l\033[2J\033[H" << std::flush;
+    // \033[?7l disables line wrapping so long song names never wrap and scroll
+    // the screen
+    std::cout << "\033[?1049h\033[?25l\033[?7l\033[2J\033[H" << std::flush;
   }
   ~TerminalSession() {
     clearTerminalCover();
     disableRawMode();
-    std::cout << "\033[?25h\033[?1049l" << std::flush;
+    std::cout << "\033[?7h\033[?25h\033[?1049l" << std::flush;
   }
 };
 
@@ -434,7 +436,7 @@ void addToQueue(AppState &app, const fs::path &path) {
 void askSearchQuery(AppState &app) {
   clearTerminalCover();
   disableRawMode();
-  std::cout << "\033[?25h\033[2J\033[H";
+  std::cout << "\033[?7h\033[?25h\033[2J\033[H";
   std::cout << kPurpleBold << "Search songs by filename: " << kReset;
   std::getline(std::cin, app.searchQuery);
 
@@ -442,7 +444,7 @@ void askSearchQuery(AppState &app) {
   app.searchCursor = selection{};
   app.tab = AppTab::Search;
 
-  std::cout << "\033[?25l";
+  std::cout << "\033[?7l\033[?25l";
   enableRawMode();
 }
 
@@ -502,10 +504,10 @@ void drawList(const std::vector<std::string> &labels,
 }
 
 void drawPlayer(const AppState &app) {
-  // Row 3 (0-indexed): PLAYER header, followed by 1 empty line (Row 4)
+  // Row 4 (1-indexed): PLAYER header, followed by 1 empty line (Row 5)
   std::cout << kPurpleBold << "PLAYER" << kReset << "\n\n";
 
-  // Rows 5..14 (0-indexed): 10 rows reserved for Album Art
+  // Rows 6..15 (1-indexed): 10 rows reserved for Album Art
   if (app.showAlbumArt && app.hasCurrentSong) {
     renderPlayerCover(app.currentSong, app.showAlbumArt,
                       app.tab == AppTab::Player);
@@ -687,7 +689,7 @@ void drawScreen(const AppState &app) {
   std::ostringstream frame;
   std::streambuf *terminalBuffer = std::cout.rdbuf(frame.rdbuf());
 
-  // Row 0: Title, Row 1: Tabs, Row 2: Separator
+  // Row 1: Title, Row 2: Tabs, Row 3: Separator
   std::cout << kPurpleBold << "M U Z X" << kReset
             << "  |  Terminal Music Player\n";
   showTabs(app.tab);
@@ -725,34 +727,43 @@ void drawScreen(const AppState &app) {
   }
 
   const std::string content = frame.str();
-  std::string output = "\033[H";
+  // Begin synchronized update (\033[?2026h) and disable line wrapping
+  // (\033[?7l)
+  std::string output = "\033[?2026h\033[?7l";
 
+  // Position every row explicitly via \033[<row>;1H so no '\n' ever scrolls the
+  // terminal
   std::size_t start = 0;
-  int rowCount = 0;
-  while (start < content.size() && rowCount < maxRows) {
+  int row = 1;
+  while (start < content.size() && row <= maxRows) {
     std::size_t end = content.find('\n', start);
-    ++rowCount;
-
+    output += "\033[" + std::to_string(row) + ";1H";
     if (end == std::string::npos) {
       output.append(content, start, std::string::npos);
       output += "\033[K";
+      ++row;
       break;
     }
-
     output.append(content, start, end - start);
     output += "\033[K";
-    // Never print a newline on the last row of the terminal so it cannot scroll
-    if (rowCount < maxRows) {
-      output += "\n";
-    }
     start = end + 1;
+    ++row;
   }
 
-  output += "\033[J";
+  // Clear remaining rows below without scrolling
+  while (row <= maxRows) {
+    output += "\033[" + std::to_string(row) + ";1H\033[K";
+    ++row;
+  }
+
+  output += "\033[H";
   std::cout << output << std::flush;
 
   drawConfirmedKittyCover(app.hasCurrentSong ? app.currentSong : "",
                           app.showAlbumArt, app.tab == AppTab::Player);
+
+  // End synchronized update
+  std::cout << "\033[?2026l" << std::flush;
 }
 
 } // namespace

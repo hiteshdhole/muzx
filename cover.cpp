@@ -157,8 +157,7 @@ void renderPlayerCover(const std::string &songPath, bool showArt,
   }
 
   if (isKittyTerminal()) {
-    // Exactly 10 lines to match the 10-row image height (no extra blank gap
-    // below)
+    // Exactly 10 lines to match the bigger 20x10 image height
     for (int i = 0; i < 10; ++i)
       std::cout << "\n";
   } else if (!cachedAnsiArt.empty()) {
@@ -197,7 +196,8 @@ void drawConfirmedKittyCover(const std::string &songPath, bool showArt,
       sizeChanged) {
     std::cout << "\033_Ga=d,d=A,q=2\033\\" << std::flush;
 
-    // 20x10 cells placed at col 2, row 5 (right below PLAYER header)
+    // Bigger prominent square: 20 columns wide by 10 rows tall placed at col 2,
+    // row 5
     std::string cmd = "kitten icat --silent --stdin=no --transfer-mode=file "
                       "--align left --place 20x10@2x5 " +
                       shellEscape(cachedCoverPath.string()) + " 2>/dev/null";
