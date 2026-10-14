@@ -23,6 +23,9 @@ public:
   void increaseVolume();
   void decreaseVolume();
 
+  void seekForward(float seconds = 5.0F);
+  void seekBackward(float seconds = 5.0F);
+
   float getVolume() const;
 };
 
