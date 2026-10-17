@@ -117,13 +117,13 @@ int readKey() {
     return static_cast<unsigned char>(value);
 
   char second = '\0';
-  if (!readByte(second, 15))
+  if (!readByte(second, 8))
     return KeyEscape;
   if (second != '[')
     return KeyEscape;
 
   char third = '\0';
-  if (!readByte(third, 15))
+  if (!readByte(third, 8))
     return KeyEscape;
   switch (third) {
   case 'A':
@@ -258,7 +258,7 @@ enum class AppTab {
 };
 
 constexpr int kTabCount = 6;
-constexpr std::size_t kVisBars = 28;
+constexpr std::size_t kVisBars = audio_player::kBandCount;
 
 struct AppState {
   audio_player player;
@@ -281,13 +281,13 @@ struct AppState {
   bool paused = false;
   bool shuffle = false;
   bool showAlbumArt = false;
+  bool showVisualizer = false;
 
-  // Status & Visualizer state
   double sessionPlayedSeconds = 0.0;
   double totalPlayedSeconds = 0.0;
   std::map<std::string, int> playCounts;
   std::array<float, kVisBars> visHeights{};
-  float visPhase = 0.0F;
+  std::array<float, kVisBars> visPeaks{};
 
   std::mt19937 rng{std::random_device{}()};
 };
@@ -361,28 +361,31 @@ void updateVisualizerAndStats(AppState &app, double dtSeconds) {
   if (activelyPlaying) {
     app.sessionPlayedSeconds += dtSeconds;
     app.totalPlayedSeconds += dtSeconds;
-    app.visPhase += static_cast<float>(dtSeconds) * 7.5F;
 
-    float volFactor = std::clamp(app.player.getVolume() / 100.0F, 0.15F, 1.0F);
-    std::uniform_real_distribution<float> jitterDist(-0.18F, 0.22F);
+    const auto realBands = app.player.getSpectrumBands();
+    const float riseAlpha =
+        std::clamp(static_cast<float>(dtSeconds) * 28.0F, 0.1F, 0.85F);
+    const float fallAlpha =
+        std::clamp(static_cast<float>(dtSeconds) * 10.0F, 0.05F, 0.45F);
 
     for (std::size_t i = 0; i < kVisBars; ++i) {
-      float fi = static_cast<float>(i);
-      float wave1 = std::sin(app.visPhase + fi * 0.45F);
-      float wave2 = std::cos(app.visPhase * 1.35F - fi * 0.7F);
-      float bassBoost = (i < 6) ? 0.25F : ((i < 16) ? 0.12F : 0.0F);
-      float target = ((wave1 * 0.4F + wave2 * 0.35F + 0.55F) + bassBoost +
-                      jitterDist(app.rng)) *
-                     volFactor;
-      target = std::clamp(target, 0.08F, 1.0F);
-      // Smooth interpolation so bars bounce fluidly
-      app.visHeights[i] = app.visHeights[i] * 0.55F + target * 0.45F;
+      const float target = realBands[i];
+      if (target > app.visHeights[i])
+        app.visHeights[i] += (target - app.visHeights[i]) * riseAlpha;
+      else
+        app.visHeights[i] += (target - app.visHeights[i]) * fallAlpha;
+
+      if (app.visHeights[i] >= app.visPeaks[i])
+        app.visPeaks[i] = app.visHeights[i];
+      else
+        app.visPeaks[i] = std::max(
+            0.0F, app.visPeaks[i] - static_cast<float>(dtSeconds) * 0.45F);
     }
   } else {
-    // Smoothly decay bars to zero when paused or stopped
     for (std::size_t i = 0; i < kVisBars; ++i) {
-      app.visHeights[i] *= 0.75F;
-      if (app.visHeights[i] < 0.02F)
+      app.visHeights[i] *= 0.80F;
+      app.visPeaks[i] *= 0.85F;
+      if (app.visHeights[i] < 0.01F)
         app.visHeights[i] = 0.0F;
     }
   }
@@ -622,12 +625,91 @@ void drawList(const std::vector<std::string> &labels,
     std::cout << kMuted << "  ...\n" << kReset;
 }
 
+const char *subBlockGlyph(int eighths) {
+  static constexpr const char *kBlocks[9] = {"  ", "▁▁", "▂▂", "▃▃", "▄▄",
+                                             "▅▅", "▆▆", "▇▇", "██"};
+  return kBlocks[std::clamp(eighths, 0, 8)];
+}
+
+void drawPlayerCoverAndVisualizer(const AppState &app) {
+  if (app.tab != AppTab::Player || (!app.showAlbumArt && !app.showVisualizer))
+    return;
+
+  std::vector<std::string> coverLines;
+  if (app.showAlbumArt && app.hasCurrentSong) {
+    std::ostringstream coverStream;
+    std::streambuf *oldBuf = std::cout.rdbuf(coverStream.rdbuf());
+    renderPlayerCover(app.currentSong, app.showAlbumArt, true);
+    std::cout.rdbuf(oldBuf);
+
+    std::istringstream iss(coverStream.str());
+    std::string line;
+    while (std::getline(iss, line)) {
+      coverLines.push_back(line);
+    }
+  }
+  while (coverLines.size() < 10) {
+    coverLines.emplace_back("");
+  }
+
+  constexpr int kTotalRows = 10;
+  constexpr int kBarRows = 9;
+
+  for (int r = 0; r < kTotalRows; ++r) {
+    if (app.showAlbumArt && app.hasCurrentSong) {
+      if (coverLines[static_cast<std::size_t>(r)].empty()) {
+        // Push the visualizer to column 28 to leave a clean gap after the
+        // 20-col cover art
+        std::cout << "\033[28G";
+      } else {
+        std::cout << coverLines[static_cast<std::size_t>(r)] << "\033[28G";
+      }
+    } else {
+      std::cout << "  ";
+    }
+
+    if (app.showVisualizer) {
+      if (r < kBarRows) {
+        const int rowFromBottom = (kBarRows - 1) - r;
+        const char *barColor =
+            (rowFromBottom >= 6)
+                ? kPink
+                : ((rowFromBottom >= 3) ? kPurpleBold : kCyanBold);
+
+        std::cout << barColor;
+        for (std::size_t b = 0; b < kVisBars; ++b) {
+          const float scaled = app.visHeights[b] * static_cast<float>(kBarRows);
+          const float rowFill = std::clamp(
+              scaled - static_cast<float>(rowFromBottom), 0.0F, 1.0F);
+          const int eighths = static_cast<int>(std::round(rowFill * 8.0F));
+
+          const int peakRow = static_cast<int>(
+              app.visPeaks[b] * static_cast<float>(kBarRows - 1));
+          if (eighths == 0 && peakRow == rowFromBottom &&
+              app.visPeaks[b] > 0.06F) {
+            std::cout << "── ";
+          } else {
+            std::cout << subBlockGlyph(eighths) << " ";
+          }
+        }
+        std::cout << kReset << "\n";
+      } else {
+        std::cout << kMuted;
+        for (std::size_t b = 0; b < kVisBars; ++b)
+          std::cout << "══ ";
+        std::cout << kReset << "\n";
+      }
+    } else {
+      std::cout << "\n";
+    }
+  }
+}
+
 void drawPlayer(const AppState &app) {
   std::cout << kPurpleBold << "PLAYER" << kReset << "\n\n";
 
-  if (app.showAlbumArt && app.hasCurrentSong) {
-    renderPlayerCover(app.currentSong, app.showAlbumArt,
-                      app.tab == AppTab::Player);
+  if ((app.showAlbumArt || app.showVisualizer) && app.hasCurrentSong) {
+    drawPlayerCoverAndVisualizer(app);
   }
 
   if (!app.hasCurrentSong) {
@@ -698,10 +780,9 @@ void drawPlayer(const AppState &app) {
     std::cout << "\n";
   }
 
-  std::cout << kMuted
-            << "  Space Play/Pause  |  ←/→ Smooth Seek  |  h/l Prev/Next  |  s "
-               "Shuffle  |  i Art ("
-            << (app.showAlbumArt ? "ON" : "OFF") << ")\n"
+  std::cout << kMuted << "  Space Play/Pause  |  ←/→ Seek  |  i Art ("
+            << (app.showAlbumArt ? "ON" : "OFF") << ")  |  v Vis ("
+            << (app.showVisualizer ? "ON" : "OFF") << ")\n"
             << kReset;
 }
 
@@ -764,15 +845,14 @@ void drawSearch(const AppState &app) {
 }
 
 void drawStatus(const AppState &app) {
-  std::cout << kPurpleBold << "STATUS & VISUALIZER" << kReset << "\n";
-  std::cout << "  PC Clock:      " << kCyanBold << currentPcTimeString()
+  std::cout << kPurpleBold << "STATUS & LISTENING STATS" << kReset << "\n\n";
+  std::cout << "  PC Clock:          " << kCyanBold << currentPcTimeString()
             << kReset << "\n";
-  std::cout << "  Session Time:  " << kGreenBold
-            << formatDurationHMS(app.sessionPlayedSeconds) << kReset
-            << "   |   All-Time Played: " << kPink
+  std::cout << "  Session Played:    " << kGreenBold
+            << formatDurationHMS(app.sessionPlayedSeconds) << kReset << "\n";
+  std::cout << "  All-Time Played:   " << kPink
             << formatDurationHMS(app.totalPlayedSeconds) << kReset << "\n";
 
-  // Top Most Played Songs
   std::vector<std::pair<std::string, int>> sortedPlays(app.playCounts.begin(),
                                                        app.playCounts.end());
   std::sort(sortedPlays.begin(), sortedPlays.end(),
@@ -782,7 +862,7 @@ void drawStatus(const AppState &app) {
   if (sortedPlays.empty()) {
     std::cout << kMuted << "    No tracks played yet.\n" << kReset;
   } else {
-    std::size_t count = std::min<std::size_t>(3, sortedPlays.size());
+    std::size_t count = std::min<std::size_t>(8, sortedPlays.size());
     for (std::size_t i = 0; i < count; ++i) {
       std::cout << "    " << (i + 1) << ". " << kPink
                 << fileName(sortedPlays[i].first) << kReset << kMuted << "  ("
@@ -791,37 +871,6 @@ void drawStatus(const AppState &app) {
                 << "\n";
     }
   }
-
-  // 6-row Spectrum Visualizer
-  std::cout << "\n  " << kPurpleBold << "MUSIC VISUALIZER" << kReset;
-  if (app.hasCurrentSong && app.playbackRunning && !app.paused) {
-    std::cout << "  —  " << kGreenBold << fileName(app.currentSong) << kReset;
-  } else {
-    std::cout << kMuted << "  (Paused / Idle)" << kReset;
-  }
-  std::cout << "\n";
-
-  constexpr int kVisRows = 6;
-  for (int row = kVisRows; row >= 1; --row) {
-    float threshold = static_cast<float>(row) / static_cast<float>(kVisRows);
-    std::cout << "    ";
-    const char *rowColor =
-        (row >= 5) ? kPink : ((row >= 3) ? kPurpleBold : kCyanBold);
-    std::cout << rowColor;
-    for (std::size_t i = 0; i < kVisBars; ++i) {
-      if (app.visHeights[i] >= threshold)
-        std::cout << "██";
-      else if (app.visHeights[i] >= threshold - (0.5F / kVisRows))
-        std::cout << "▄▄";
-      else
-        std::cout << "  ";
-    }
-    std::cout << kReset << "\n";
-  }
-  std::cout << kMuted << "    ";
-  for (std::size_t i = 0; i < kVisBars; ++i)
-    std::cout << "══";
-  std::cout << kReset << "\n";
 }
 
 void drawKeybindings() {
@@ -846,14 +895,15 @@ void drawKeybindings() {
   row("h / l", "Previous / next song on Player");
   row("n / b", "Next / previous song (global)");
   row("s", "Toggle shuffle");
-  row("i", "Toggle album art (default hidden)");
+  row("i", "Toggle Album Art");
+  row("v", "Toggle Audio Visualizer");
   row("+ / -", "Adjust volume");
   row("x", "Stop playback");
 
   std::cout << "\n";
   section("NAVIGATION & TABS");
   row("Tab / Shift+Tab", "Cycle tabs (or keys 1-6)");
-  row("5", "Open Status & Music Visualizer");
+  row("5", "Open Status (Clock, Played Time, Top Songs)");
   row("j / k  or  ↑ / ↓", "Navigate lists");
   row("l / Enter", "Open folder / play selected song");
   row("Backspace / h", "Parent folder");
@@ -899,7 +949,7 @@ void drawScreen(const AppState &app) {
 
   std::cout << kMuted
             << "------------------------------------------------------------\n"
-            << "  Tab/1-6 Tabs  |  Space Play/Pause  |  ←/→ Seek  |  i Art  |  "
+            << "  Tab/1-6 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  "
                "q/Esc Quit"
             << kReset;
   std::cout.flush();
@@ -938,7 +988,8 @@ void drawScreen(const AppState &app) {
   std::cout << output << std::flush;
 
   drawConfirmedKittyCover(app.hasCurrentSong ? app.currentSong : "",
-                          app.showAlbumArt, app.tab == AppTab::Player);
+                          app.showAlbumArt && app.tab == AppTab::Player,
+                          app.tab == AppTab::Player);
 }
 
 } // namespace
@@ -990,7 +1041,6 @@ int main() {
     double dt = std::chrono::duration<double>(now - lastTick).count();
     lastTick = now;
 
-    // Commit any smooth seek after key-repeat settles
     app.player.update();
     checkAutomaticNext(app);
     updateVisualizerAndStats(app, dt);
@@ -1002,9 +1052,8 @@ int main() {
     }
 
     drawScreen(app);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
 
-    // Drain all queued keypresses in a single frame so holding ←/→ never lags
     int key = KeyNone;
     while ((key = readKey()) != KeyNone) {
       if (key >= '1' && key <= '6') {
@@ -1040,6 +1089,10 @@ int main() {
       }
       if (key == 'i') {
         app.showAlbumArt = !app.showAlbumArt;
+        continue;
+      }
+      if (key == 'v') {
+        app.showVisualizer = !app.showVisualizer;
         continue;
       }
       if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
