@@ -17,6 +17,7 @@ std::string shellEscape(const std::string &input) {
       out += c;
   }
   out += "'";
+  return out;
 }
 
 bool convertToCleanWav(const std::string &inputPath,
@@ -34,13 +35,135 @@ bool convertToCleanWav(const std::string &inputPath,
 
 } // namespace
 
+void audio_player::VisualMusic::onSeek(sf::Time timeOffset) {
+  sf::Music::onSeek(timeOffset);
+  const unsigned int rate = std::max(1U, getSampleRate());
+  std::lock_guard<std::mutex> lock(ringMutex);
+  ringEndFrame = static_cast<std::int64_t>(timeOffset.asSeconds() *
+                                           static_cast<float>(rate));
+  ++seekEpoch;
+}
+
+bool audio_player::VisualMusic::onGetData(Chunk &data) {
+  std::uint64_t epochBefore = 0;
+  {
+    std::lock_guard<std::mutex> lock(ringMutex);
+    epochBefore = seekEpoch;
+  }
+
+  if (!sf::Music::onGetData(data)) {
+    return false;
+  }
+
+  if (data.samples == nullptr || data.sampleCount == 0) {
+    return true;
+  }
+
+  const unsigned int channels = std::max(1U, getChannelCount());
+  const std::size_t frames = data.sampleCount / channels;
+
+  std::lock_guard<std::mutex> lock(ringMutex);
+  if (seekEpoch != epochBefore) {
+    // A seek happened while decoding; resync to current playing offset
+    ringEndFrame = static_cast<std::int64_t>(
+        getPlayingOffset().asSeconds() *
+        static_cast<float>(std::max(1U, getSampleRate())));
+  }
+
+  for (std::size_t f = 0; f < frames; ++f) {
+    float mono = 0.0F;
+    for (unsigned int c = 0; c < channels; ++c) {
+      mono += static_cast<float>(data.samples[f * channels + c]) / 32768.0F;
+    }
+    mono /= static_cast<float>(channels);
+
+    const std::size_t idx = static_cast<std::size_t>(
+        ringEndFrame % static_cast<std::int64_t>(kRingFrames));
+    monoRing[idx] = mono;
+    ++ringEndFrame;
+  }
+
+  return true;
+}
+
+std::array<float, audio_player::kBandCount>
+audio_player::VisualMusic::sampleCurrentWindow() const {
+  std::array<float, kBandCount> out{};
+  const unsigned int rate = std::max(1U, getSampleRate());
+  const float currentSec = getPlayingOffset().asSeconds();
+  const std::int64_t playFrame =
+      static_cast<std::int64_t>(currentSec * static_cast<float>(rate));
+
+  constexpr std::size_t kWindow = 1024;
+  std::array<float, kWindow> window{};
+
+  {
+    std::lock_guard<std::mutex> lock(ringMutex);
+    if (ringEndFrame <= 0)
+      return out;
+
+    std::int64_t startFrame =
+        playFrame - static_cast<std::int64_t>(kWindow / 2);
+    if (startFrame + static_cast<std::int64_t>(kWindow) > ringEndFrame) {
+      startFrame = ringEndFrame - static_cast<std::int64_t>(kWindow);
+    }
+    if (startFrame < 0)
+      startFrame = 0;
+
+    for (std::size_t i = 0; i < kWindow; ++i) {
+      const std::size_t ringIdx =
+          static_cast<std::size_t>((startFrame + static_cast<std::int64_t>(i)) %
+                                   static_cast<std::int64_t>(kRingFrames));
+      window[i] = monoRing[ringIdx];
+    }
+  }
+
+  // 4-stage filter bank across the 1024-sample real-time window
+  // Separates Sub-Bass, Bass, Low-Mids, High-Mids, and Treble at 60 FPS
+  std::array<float, kBandCount> energy{};
+  float lp1 = 0.0F;
+  float lp2 = 0.0F;
+  float lp3 = 0.0F;
+  float lp4 = 0.0F;
+
+  for (std::size_t i = 0; i < kWindow; ++i) {
+    const float x = window[i];
+    lp1 += 0.04F * (x - lp1); // Sub-bass (< 250 Hz)
+    lp2 += 0.12F * (x - lp2); // Bass (250 - 750 Hz)
+    lp3 += 0.28F * (x - lp3); // Mids (750 - 2200 Hz)
+    lp4 += 0.55F * (x - lp4); // Upper-Mids (2200 - 5000 Hz)
+
+    const float band0 = lp1;
+    const float band1 = lp2 - lp1;
+    const float band2 = lp3 - lp2;
+    const float band3 = lp4 - lp3;
+    const float band4 = x - lp4; // Treble / Hi-hats (> 5000 Hz)
+
+    // Sub-divide into 16 visually distinct bars using time-slice & harmonic mix
+    const std::size_t slice = (i * 4) / kWindow; // 0..3
+    energy[0 + slice] += (band0 * 2.4F) * (band0 * 2.4F);
+    energy[4 + slice] += (band1 * 2.8F) * (band1 * 2.8F);
+    energy[8 + slice] += (band2 * 3.2F) * (band2 * 3.2F);
+    energy[12 + slice] +=
+        ((band3 * 2.6F + band4 * 3.4F)) * ((band3 * 2.6F + band4 * 3.4F));
+  }
+
+  constexpr float kSliceSamples = static_cast<float>(kWindow) / 4.0F;
+  for (std::size_t b = 0; b < kBandCount; ++b) {
+    const float rms = std::sqrt(energy[b] / kSliceSamples);
+    // Smooth logarithmic curve so quiet and loud beats both look dynamic
+    out[b] = std::clamp(std::pow(rms * 2.6F, 0.65F), 0.0F, 1.0F);
+  }
+
+  return out;
+}
+
 bool audio_player::load(const std::string &filename) {
   hasPendingSeek = false;
   pendingSeekTarget = 0.0F;
   song.stop();
+  song.resetRing();
 
-  // Silence SFML's internal sf::err() stream so corrupt headers never print
-  // onto the TUI
   static std::ostringstream nullStream;
   sf::err().rdbuf(nullStream.rdbuf());
 
@@ -51,13 +174,10 @@ bool audio_player::load(const std::string &filename) {
     opened = false;
   }
 
-  // If SFML opened it, verify duration is valid (> 0 seconds)
   if (opened && song.getDuration().asSeconds() > 0.1F) {
     return true;
   }
 
-  // Fallback: Song is AAC/M4A/Opus disguised as .mp3 or has corrupt ID3 tags.
-  // Transcode via ffmpeg to a clean PCM WAV so MUZX never fails or crashes.
   const std::string fallbackWav = "/tmp/muzx_fallback.wav";
   if (convertToCleanWav(filename, fallbackWav)) {
     try {
@@ -90,6 +210,7 @@ void audio_player::resume() { song.play(); }
 void audio_player::stop() {
   hasPendingSeek = false;
   song.stop();
+  song.resetRing();
 }
 
 void audio_player::update() {
@@ -101,9 +222,7 @@ void audio_player::update() {
       std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSeekInput)
           .count();
 
-  // Wait 110ms after the last Left/Right key repeat before committing hardware
-  // seek
-  if (elapsedMs >= 110) {
+  if (elapsedMs >= 90) {
     song.setPlayingOffset(sf::seconds(pendingSeekTarget));
     hasPendingSeek = false;
   }
@@ -148,8 +267,6 @@ void audio_player::seekForward(float seconds) {
 
   const float current =
       hasPendingSeek ? pendingSeekTarget : song.getPlayingOffset().asSeconds();
-  // Keep 0.3s margin from the end so seeking forward doesn't accidentally stop
-  // the track
   const float maxTarget = std::max(0.0F, duration - 0.3F);
   pendingSeekTarget =
       std::clamp(current + std::max(0.0F, seconds), 0.0F, maxTarget);
@@ -167,4 +284,17 @@ void audio_player::seekBackward(float seconds) {
   pendingSeekTarget = std::max(0.0F, current - std::max(0.0F, seconds));
   hasPendingSeek = true;
   lastSeekInput = std::chrono::steady_clock::now();
+}
+
+std::array<float, audio_player::kBandCount>
+audio_player::getSpectrumBands() const {
+  if (song.getStatus() != sf::Music::Status::Playing) {
+    return {};
+  }
+  auto bands = song.sampleCurrentWindow();
+  const float volScale = std::clamp(song.getVolume() / 100.0F, 0.1F, 1.0F);
+  for (float &b : bands) {
+    b = std::clamp(b * volScale, 0.0F, 1.0F);
+  }
+  return bands;
 }
