@@ -4,11 +4,17 @@
 #include "queue.hpp"
 #include "selection.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -30,6 +36,7 @@ constexpr const char *kMuted = "\033[90m";
 constexpr const char *kPurpleBold = "\033[1;35m";
 constexpr const char *kPink = "\033[95m";
 constexpr const char *kGreenBold = "\033[1;32m";
+constexpr const char *kCyanBold = "\033[1;36m";
 
 enum Key : int {
   KeyNone = 0,
@@ -72,8 +79,6 @@ class TerminalSession {
 public:
   TerminalSession() {
     enableRawMode();
-    // \033[?7l disables line wrapping so long song names never wrap and scroll
-    // the screen
     std::cout << "\033[?1049h\033[?25l\033[?7l\033[2J\033[H" << std::flush;
   }
   ~TerminalSession() {
@@ -112,13 +117,13 @@ int readKey() {
     return static_cast<unsigned char>(value);
 
   char second = '\0';
-  if (!readByte(second, 35))
+  if (!readByte(second, 15))
     return KeyEscape;
   if (second != '[')
     return KeyEscape;
 
   char third = '\0';
-  if (!readByte(third, 35))
+  if (!readByte(third, 15))
     return KeyEscape;
   switch (third) {
   case 'A':
@@ -146,7 +151,8 @@ std::string lowerCase(std::string value) {
 bool isAudioFile(const fs::path &path) {
   const std::string ext = lowerCase(path.extension().string());
   return ext == ".mp3" || ext == ".ogg" || ext == ".wav" || ext == ".flac" ||
-         ext == ".aiff" || ext == ".au";
+         ext == ".aiff" || ext == ".au" || ext == ".m4a" || ext == ".opus" ||
+         ext == ".aac";
 }
 
 std::vector<fs::path> directoryEntries(const fs::path &folder) {
@@ -237,6 +243,8 @@ std::vector<fs::path> searchAudioFiles(const fs::path &root,
 }
 
 std::string fileName(const std::string &path) {
+  if (path.empty())
+    return "";
   return fs::path(path).filename().string();
 }
 
@@ -245,8 +253,12 @@ enum class AppTab {
   Folders = 1,
   Queue = 2,
   Search = 3,
-  Keybindings = 4
+  Status = 4,
+  Keybindings = 5
 };
+
+constexpr int kTabCount = 6;
+constexpr std::size_t kVisBars = 28;
 
 struct AppState {
   audio_player player;
@@ -254,6 +266,7 @@ struct AppState {
   AppTab tab = AppTab::Player;
   fs::path musicRoot;
   fs::path browseFolder;
+  fs::path statsFile;
   std::vector<fs::path> folderEntries;
   std::vector<fs::path> searchResults;
   selection folderCursor;
@@ -268,8 +281,112 @@ struct AppState {
   bool paused = false;
   bool shuffle = false;
   bool showAlbumArt = false;
+
+  // Status & Visualizer state
+  double sessionPlayedSeconds = 0.0;
+  double totalPlayedSeconds = 0.0;
+  std::map<std::string, int> playCounts;
+  std::array<float, kVisBars> visHeights{};
+  float visPhase = 0.0F;
+
   std::mt19937 rng{std::random_device{}()};
 };
+
+void loadStats(AppState &app) {
+  std::ifstream in(app.statsFile);
+  if (!in)
+    return;
+
+  std::string line;
+  if (std::getline(in, line)) {
+    try {
+      app.totalPlayedSeconds = std::stod(line);
+    } catch (...) {
+      app.totalPlayedSeconds = 0.0;
+    }
+  }
+
+  while (std::getline(in, line)) {
+    auto tabPos = line.find('\t');
+    if (tabPos != std::string::npos) {
+      try {
+        int count = std::stoi(line.substr(0, tabPos));
+        std::string songPath = line.substr(tabPos + 1);
+        if (!songPath.empty() && count > 0)
+          app.playCounts[songPath] = count;
+      } catch (...) {
+      }
+    }
+  }
+}
+
+void saveStats(const AppState &app) {
+  if (app.statsFile.empty())
+    return;
+  std::ofstream out(app.statsFile);
+  if (!out)
+    return;
+
+  out << static_cast<long long>(app.totalPlayedSeconds) << "\n";
+  for (const auto &[songPath, count] : app.playCounts) {
+    out << count << "\t" << songPath << "\n";
+  }
+}
+
+std::string formatDurationHMS(double totalSeconds) {
+  long long secs = static_cast<long long>(std::max(0.0, totalSeconds));
+  long long hours = secs / 3600;
+  long long minutes = (secs % 3600) / 60;
+  long long remSecs = secs % 60;
+
+  std::ostringstream oss;
+  oss << hours << "h " << std::setw(2) << std::setfill('0') << minutes << "m "
+      << std::setw(2) << std::setfill('0') << remSecs << "s";
+  return oss.str();
+}
+
+std::string currentPcTimeString() {
+  std::time_t now = std::time(nullptr);
+  std::tm localTm{};
+  localtime_r(&now, &localTm);
+  char buf[64]{};
+  std::strftime(buf, sizeof(buf), "%I:%M:%S %p  |  %a, %d %b %Y", &localTm);
+  return std::string(buf);
+}
+
+void updateVisualizerAndStats(AppState &app, double dtSeconds) {
+  const bool activelyPlaying =
+      app.hasCurrentSong && app.playbackRunning && !app.paused;
+
+  if (activelyPlaying) {
+    app.sessionPlayedSeconds += dtSeconds;
+    app.totalPlayedSeconds += dtSeconds;
+    app.visPhase += static_cast<float>(dtSeconds) * 7.5F;
+
+    float volFactor = std::clamp(app.player.getVolume() / 100.0F, 0.15F, 1.0F);
+    std::uniform_real_distribution<float> jitterDist(-0.18F, 0.22F);
+
+    for (std::size_t i = 0; i < kVisBars; ++i) {
+      float fi = static_cast<float>(i);
+      float wave1 = std::sin(app.visPhase + fi * 0.45F);
+      float wave2 = std::cos(app.visPhase * 1.35F - fi * 0.7F);
+      float bassBoost = (i < 6) ? 0.25F : ((i < 16) ? 0.12F : 0.0F);
+      float target = ((wave1 * 0.4F + wave2 * 0.35F + 0.55F) + bassBoost +
+                      jitterDist(app.rng)) *
+                     volFactor;
+      target = std::clamp(target, 0.08F, 1.0F);
+      // Smooth interpolation so bars bounce fluidly
+      app.visHeights[i] = app.visHeights[i] * 0.55F + target * 0.45F;
+    }
+  } else {
+    // Smoothly decay bars to zero when paused or stopped
+    for (std::size_t i = 0; i < kVisBars; ++i) {
+      app.visHeights[i] *= 0.75F;
+      if (app.visHeights[i] < 0.02F)
+        app.visHeights[i] = 0.0F;
+    }
+  }
+}
 
 std::size_t folderMenuSize(const AppState &app) {
   return app.folderEntries.empty() ? 0 : app.folderEntries.size() + 1;
@@ -297,6 +414,8 @@ bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
         app.hasCurrentSong = true;
         app.playbackRunning = true;
         app.paused = false;
+        app.playCounts[path]++;
+        saveStats(app);
         if (switchToPlayer)
           app.tab = AppTab::Player;
         loadedSuccessfully = true;
@@ -404,13 +523,13 @@ void togglePause(AppState &app) {
 void seekLeft(AppState &app) {
   if (!app.hasCurrentSong)
     return;
-  app.player.seekBackward(5.0F);
+  app.player.seekBackward(2.5F);
 }
 
 void seekRight(AppState &app) {
   if (!app.hasCurrentSong)
     return;
-  app.player.seekForward(5.0F);
+  app.player.seekForward(2.5F);
 }
 
 std::vector<std::string> queueAsList(const queue &songQueue) {
@@ -459,10 +578,10 @@ std::size_t visualLength(const std::string &text) {
 
 void showTabs(AppTab active) {
   std::cout << kPurpleBold << "MUZX  " << kReset;
-  const char *names[] = {"1 Player", "2 Folders", "3 Queue", "4 Search",
-                         "5 Keys"};
+  const char *names[] = {"1 Player", "2 Folders", "3 Queue",
+                         "4 Search", "5 Status",  "6 Keys"};
 
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < kTabCount; ++i) {
     AppTab tab = static_cast<AppTab>(i);
     if (tab == active)
       std::cout << kSelected << " " << names[i] << " " << kReset << "  ";
@@ -504,10 +623,8 @@ void drawList(const std::vector<std::string> &labels,
 }
 
 void drawPlayer(const AppState &app) {
-  // Row 4 (1-indexed): PLAYER header, followed by 1 empty line (Row 5)
   std::cout << kPurpleBold << "PLAYER" << kReset << "\n\n";
 
-  // Rows 6..15 (1-indexed): 10 rows reserved for Album Art
   if (app.showAlbumArt && app.hasCurrentSong) {
     renderPlayerCover(app.currentSong, app.showAlbumArt,
                       app.tab == AppTab::Player);
@@ -520,13 +637,16 @@ void drawPlayer(const AppState &app) {
   } else {
     float duration = app.player.getDuration().asSeconds();
     float position = app.player.getPlayingOffset().asSeconds();
-    if (position < 0)
-      position = 0;
-    if (duration > 0 && position > duration)
+    if (std::isnan(duration) || std::isinf(duration) || duration < 0.0F)
+      duration = 0.0F;
+    if (std::isnan(position) || std::isinf(position) || position < 0.0F)
+      position = 0.0F;
+    if (duration > 0.0F && position > duration)
       position = duration;
 
     int percent =
-        duration > 0 ? static_cast<int>((position / duration) * 100) : 0;
+        duration > 0.1F ? static_cast<int>((position / duration) * 100.0F) : 0;
+    percent = std::clamp(percent, 0, 100);
 
     std::cout << "  Song:    " << kPink << fileName(app.currentSong) << kReset
               << "\n";
@@ -543,8 +663,9 @@ void drawPlayer(const AppState &app) {
 
     constexpr int width = 30;
     int filled =
-        duration > 0
-            ? static_cast<int>((static_cast<float>(percent) / 100) * width)
+        duration > 0.1F
+            ? std::clamp(static_cast<int>((position / duration) * width), 0,
+                         width)
             : 0;
 
     std::cout << "  [";
@@ -553,7 +674,7 @@ void drawPlayer(const AppState &app) {
     std::cout << "] " << percent << "%\n";
 
     auto formatTime = [](float seconds) {
-      int total = static_cast<int>(seconds);
+      int total = std::max(0, static_cast<int>(seconds));
       int minutes = total / 60;
       int secs = total % 60;
       std::string result = std::to_string(minutes) + ":";
@@ -565,7 +686,8 @@ void drawPlayer(const AppState &app) {
 
     std::cout << "  Time:    " << formatTime(position) << " / "
               << formatTime(duration)
-              << "   |   Volume: " << app.player.getVolume() << "%\n";
+              << "   |   Volume: " << static_cast<int>(app.player.getVolume())
+              << "%\n";
     std::cout << "  Shuffle: "
               << (app.shuffle ? std::string(kGreenBold) + "ON"
                               : std::string(kMuted) + "OFF")
@@ -577,7 +699,7 @@ void drawPlayer(const AppState &app) {
   }
 
   std::cout << kMuted
-            << "  Space Play/Pause  |  ←/→ Seek 5s  |  h/l Prev/Next  |  s "
+            << "  Space Play/Pause  |  ←/→ Smooth Seek  |  h/l Prev/Next  |  s "
                "Shuffle  |  i Art ("
             << (app.showAlbumArt ? "ON" : "OFF") << ")\n"
             << kReset;
@@ -641,6 +763,67 @@ void drawSearch(const AppState &app) {
   drawList(labels, app.searchCursor.current());
 }
 
+void drawStatus(const AppState &app) {
+  std::cout << kPurpleBold << "STATUS & VISUALIZER" << kReset << "\n";
+  std::cout << "  PC Clock:      " << kCyanBold << currentPcTimeString()
+            << kReset << "\n";
+  std::cout << "  Session Time:  " << kGreenBold
+            << formatDurationHMS(app.sessionPlayedSeconds) << kReset
+            << "   |   All-Time Played: " << kPink
+            << formatDurationHMS(app.totalPlayedSeconds) << kReset << "\n";
+
+  // Top Most Played Songs
+  std::vector<std::pair<std::string, int>> sortedPlays(app.playCounts.begin(),
+                                                       app.playCounts.end());
+  std::sort(sortedPlays.begin(), sortedPlays.end(),
+            [](const auto &a, const auto &b) { return a.second > b.second; });
+
+  std::cout << "\n  " << kPurpleBold << "MOST PLAYED TRACKS" << kReset << "\n";
+  if (sortedPlays.empty()) {
+    std::cout << kMuted << "    No tracks played yet.\n" << kReset;
+  } else {
+    std::size_t count = std::min<std::size_t>(3, sortedPlays.size());
+    for (std::size_t i = 0; i < count; ++i) {
+      std::cout << "    " << (i + 1) << ". " << kPink
+                << fileName(sortedPlays[i].first) << kReset << kMuted << "  ("
+                << sortedPlays[i].second
+                << (sortedPlays[i].second == 1 ? " play)" : " plays)") << kReset
+                << "\n";
+    }
+  }
+
+  // 6-row Spectrum Visualizer
+  std::cout << "\n  " << kPurpleBold << "MUSIC VISUALIZER" << kReset;
+  if (app.hasCurrentSong && app.playbackRunning && !app.paused) {
+    std::cout << "  —  " << kGreenBold << fileName(app.currentSong) << kReset;
+  } else {
+    std::cout << kMuted << "  (Paused / Idle)" << kReset;
+  }
+  std::cout << "\n";
+
+  constexpr int kVisRows = 6;
+  for (int row = kVisRows; row >= 1; --row) {
+    float threshold = static_cast<float>(row) / static_cast<float>(kVisRows);
+    std::cout << "    ";
+    const char *rowColor =
+        (row >= 5) ? kPink : ((row >= 3) ? kPurpleBold : kCyanBold);
+    std::cout << rowColor;
+    for (std::size_t i = 0; i < kVisBars; ++i) {
+      if (app.visHeights[i] >= threshold)
+        std::cout << "██";
+      else if (app.visHeights[i] >= threshold - (0.5F / kVisRows))
+        std::cout << "▄▄";
+      else
+        std::cout << "  ";
+    }
+    std::cout << kReset << "\n";
+  }
+  std::cout << kMuted << "    ";
+  for (std::size_t i = 0; i < kVisBars; ++i)
+    std::cout << "══";
+  std::cout << kReset << "\n";
+}
+
 void drawKeybindings() {
   constexpr std::size_t kColumnWidth = 20;
 
@@ -659,7 +842,7 @@ void drawKeybindings() {
 
   section("PLAYBACK");
   row("Space", "Play / pause");
-  row("← / →  or  a / d", "Seek 5 seconds backward / forward");
+  row("← / →  or  a / d", "Smooth seek backward / forward");
   row("h / l", "Previous / next song on Player");
   row("n / b", "Next / previous song (global)");
   row("s", "Toggle shuffle");
@@ -668,8 +851,9 @@ void drawKeybindings() {
   row("x", "Stop playback");
 
   std::cout << "\n";
-  section("NAVIGATION & FOLDERS");
-  row("Tab / Shift+Tab", "Change tabs (or 1-5)");
+  section("NAVIGATION & TABS");
+  row("Tab / Shift+Tab", "Cycle tabs (or keys 1-6)");
+  row("5", "Open Status & Music Visualizer");
   row("j / k  or  ↑ / ↓", "Navigate lists");
   row("l / Enter", "Open folder / play selected song");
   row("Backspace / h", "Parent folder");
@@ -681,7 +865,6 @@ void drawKeybindings() {
   row("r", "Remove selected Queue item");
   row("c", "Clear Queue");
   row("/", "Search songs by filename");
-  row("Enter", "Play selected Search / Queue item");
   row("q / Esc", "Quit MUZX");
 }
 
@@ -689,7 +872,6 @@ void drawScreen(const AppState &app) {
   std::ostringstream frame;
   std::streambuf *terminalBuffer = std::cout.rdbuf(frame.rdbuf());
 
-  // Row 1: Title, Row 2: Tabs, Row 3: Separator
   std::cout << kPurpleBold << "M U Z X" << kReset
             << "  |  Terminal Music Player\n";
   showTabs(app.tab);
@@ -707,6 +889,9 @@ void drawScreen(const AppState &app) {
   case AppTab::Search:
     drawSearch(app);
     break;
+  case AppTab::Status:
+    drawStatus(app);
+    break;
   case AppTab::Keybindings:
     drawKeybindings();
     break;
@@ -714,7 +899,7 @@ void drawScreen(const AppState &app) {
 
   std::cout << kMuted
             << "------------------------------------------------------------\n"
-            << "  Tab/Shift+Tab Tabs  |  Space Play/Pause  |  i Art Toggle  |  "
+            << "  Tab/1-6 Tabs  |  Space Play/Pause  |  ←/→ Seek  |  i Art  |  "
                "q/Esc Quit"
             << kReset;
   std::cout.flush();
@@ -727,43 +912,33 @@ void drawScreen(const AppState &app) {
   }
 
   const std::string content = frame.str();
-  // Begin synchronized update (\033[?2026h) and disable line wrapping
-  // (\033[?7l)
-  std::string output = "\033[?2026h\033[?7l";
+  std::string output = "\033[?7l\033[H";
 
-  // Position every row explicitly via \033[<row>;1H so no '\n' ever scrolls the
-  // terminal
   std::size_t start = 0;
-  int row = 1;
-  while (start < content.size() && row <= maxRows) {
+  int rowCount = 0;
+  while (start < content.size() && rowCount < maxRows) {
     std::size_t end = content.find('\n', start);
-    output += "\033[" + std::to_string(row) + ";1H";
+    ++rowCount;
+
     if (end == std::string::npos) {
       output.append(content, start, std::string::npos);
       output += "\033[K";
-      ++row;
       break;
     }
+
     output.append(content, start, end - start);
     output += "\033[K";
+    if (rowCount < maxRows) {
+      output += "\n";
+    }
     start = end + 1;
-    ++row;
   }
 
-  // Clear remaining rows below without scrolling
-  while (row <= maxRows) {
-    output += "\033[" + std::to_string(row) + ";1H\033[K";
-    ++row;
-  }
-
-  output += "\033[H";
+  output += "\033[J\033[H";
   std::cout << output << std::flush;
 
   drawConfirmedKittyCover(app.hasCurrentSong ? app.currentSong : "",
                           app.showAlbumArt, app.tab == AppTab::Player);
-
-  // End synchronized update
-  std::cout << "\033[?2026l" << std::flush;
 }
 
 } // namespace
@@ -800,184 +975,211 @@ int main() {
       home ? fs::path(home) / ".config" / "muzx" : fs::current_path() / ".muzx";
   fs::create_directories(configDirectory, ec);
   const fs::path queueFile = configDirectory / "queue.txt";
+  app.statsFile = configDirectory / "stats.txt";
+
   app.songQueue.load(queueFile.string());
+  loadStats(app);
 
   TerminalSession terminal;
   bool running = true;
+  auto lastTick = std::chrono::steady_clock::now();
+  double statsSaveAccumulator = 0.0;
 
   while (running) {
+    auto now = std::chrono::steady_clock::now();
+    double dt = std::chrono::duration<double>(now - lastTick).count();
+    lastTick = now;
+
+    // Commit any smooth seek after key-repeat settles
+    app.player.update();
     checkAutomaticNext(app);
+    updateVisualizerAndStats(app, dt);
+
+    statsSaveAccumulator += dt;
+    if (statsSaveAccumulator >= 5.0) {
+      saveStats(app);
+      statsSaveAccumulator = 0.0;
+    }
+
     drawScreen(app);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
-    int key = readKey();
-    if (key == KeyNone)
-      continue;
+    // Drain all queued keypresses in a single frame so holding ←/→ never lags
+    int key = KeyNone;
+    while ((key = readKey()) != KeyNone) {
+      if (key >= '1' && key <= '6') {
+        app.tab = static_cast<AppTab>(key - '1');
+        continue;
+      }
+      if (key == '\t') {
+        app.tab =
+            static_cast<AppTab>((static_cast<int>(app.tab) + 1) % kTabCount);
+        continue;
+      }
+      if (key == KeyShiftTab) {
+        app.tab = static_cast<AppTab>(
+            (static_cast<int>(app.tab) + kTabCount - 1) % kTabCount);
+        continue;
+      }
 
-    if (key >= '1' && key <= '5') {
-      app.tab = static_cast<AppTab>(key - '1');
-      continue;
-    }
-    if (key == '\t') {
-      app.tab = static_cast<AppTab>((static_cast<int>(app.tab) + 1) % 5);
-      continue;
-    }
-    if (key == KeyShiftTab) {
-      app.tab = static_cast<AppTab>((static_cast<int>(app.tab) + 4) % 5);
-      continue;
-    }
+      if (key == 'q' || key == KeyEscape) {
+        running = false;
+        break;
+      }
+      if (key == ' ') {
+        togglePause(app);
+        continue;
+      }
+      if (key == 'P') {
+        playFolder(app, app.musicRoot, true);
+        continue;
+      }
+      if (key == 's') {
+        app.shuffle = !app.shuffle;
+        continue;
+      }
+      if (key == 'i') {
+        app.showAlbumArt = !app.showAlbumArt;
+        continue;
+      }
+      if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
+        nextSong(app);
+        continue;
+      }
+      if (key == 'b' || (app.tab == AppTab::Player && key == 'h')) {
+        previousSong(app);
+        continue;
+      }
+      if (key == KeyLeft || key == 'a') {
+        seekLeft(app);
+        continue;
+      }
+      if (key == KeyRight || key == 'd') {
+        seekRight(app);
+        continue;
+      }
+      if (key == 'x') {
+        app.player.stop();
+        app.playbackRunning = false;
+        app.paused = false;
+        continue;
+      }
+      if (key == '+' || key == '=') {
+        app.player.increaseVolume();
+        continue;
+      }
+      if (key == '-') {
+        app.player.decreaseVolume();
+        continue;
+      }
+      if (key == '/') {
+        askSearchQuery(app);
+        break;
+      }
 
-    if (key == 'q' || key == KeyEscape) {
-      running = false;
-      continue;
-    }
-    if (key == ' ') {
-      togglePause(app);
-      continue;
-    }
-    if (key == 'P') {
-      playFolder(app, app.musicRoot, true);
-      continue;
-    }
-    if (key == 's') {
-      app.shuffle = !app.shuffle;
-      continue;
-    }
-    if (key == 'i') {
-      app.showAlbumArt = !app.showAlbumArt;
-      continue;
-    }
-    if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
-      nextSong(app);
-      continue;
-    }
-    if (key == 'b' || (app.tab == AppTab::Player && key == 'h')) {
-      previousSong(app);
-      continue;
-    }
-    if (key == KeyLeft || key == 'a') {
-      seekLeft(app);
-      continue;
-    }
-    if (key == KeyRight || key == 'd') {
-      seekRight(app);
-      continue;
-    }
-    if (key == 'x') {
-      app.player.stop();
-      app.playbackRunning = false;
-      app.paused = false;
-      continue;
-    }
-    if (key == '+' || key == '=') {
-      app.player.increaseVolume();
-      continue;
-    }
-    if (key == '-') {
-      app.player.decreaseVolume();
-      continue;
-    }
-    if (key == '/') {
-      askSearchQuery(app);
-      continue;
-    }
+      if (key == 'j' || key == KeyDown) {
+        if (app.tab == AppTab::Folders && !app.folderEntries.empty())
+          app.folderCursor.moveDown(folderMenuSize(app));
+        else if (app.tab == AppTab::Queue && !app.songQueue.empty())
+          app.queueCursor.moveDown(app.songQueue.size());
+        else if (app.tab == AppTab::Search && !app.searchResults.empty())
+          app.searchCursor.moveDown(app.searchResults.size());
+        continue;
+      }
+      if (key == 'k' || key == KeyUp) {
+        if (app.tab == AppTab::Folders && !app.folderEntries.empty())
+          app.folderCursor.moveUp(folderMenuSize(app));
+        else if (app.tab == AppTab::Queue && !app.songQueue.empty())
+          app.queueCursor.moveUp(app.songQueue.size());
+        else if (app.tab == AppTab::Search && !app.searchResults.empty())
+          app.searchCursor.moveUp(app.searchResults.size());
+        continue;
+      }
 
-    if (key == 'j' || key == KeyDown) {
-      if (app.tab == AppTab::Folders && !app.folderEntries.empty())
-        app.folderCursor.moveDown(folderMenuSize(app));
-      else if (app.tab == AppTab::Queue && !app.songQueue.empty())
-        app.queueCursor.moveDown(app.songQueue.size());
-      else if (app.tab == AppTab::Search && !app.searchResults.empty())
-        app.searchCursor.moveDown(app.searchResults.size());
-      continue;
-    }
-    if (key == 'k' || key == KeyUp) {
-      if (app.tab == AppTab::Folders && !app.folderEntries.empty())
-        app.folderCursor.moveUp(folderMenuSize(app));
-      else if (app.tab == AppTab::Queue && !app.songQueue.empty())
-        app.queueCursor.moveUp(app.songQueue.size());
-      else if (app.tab == AppTab::Search && !app.searchResults.empty())
-        app.searchCursor.moveUp(app.searchResults.size());
-      continue;
-    }
-
-    if (app.tab == AppTab::Folders) {
-      if (key == KeyBackspace || key == 'h') {
-        if (app.browseFolder != app.musicRoot) {
-          app.browseFolder = app.browseFolder.parent_path();
-          app.folderEntries = directoryEntries(app.browseFolder);
-          app.folderCursor = selection{};
-        }
-      } else if (key == 'p') {
-        if (!app.folderEntries.empty()) {
-          std::size_t index = app.folderCursor.current();
-          if (index > 0 && index - 1 < app.folderEntries.size() &&
-              fs::is_directory(app.folderEntries[index - 1], ec)) {
-            playFolder(app, app.folderEntries[index - 1], true);
-          } else {
-            playFolder(app, app.browseFolder, true);
+      if (app.tab == AppTab::Folders) {
+        if (key == KeyBackspace || key == 'h') {
+          if (app.browseFolder != app.musicRoot) {
+            app.browseFolder = app.browseFolder.parent_path();
+            app.folderEntries = directoryEntries(app.browseFolder);
+            app.folderCursor = selection{};
           }
-        }
-      } else if (key == 'e') {
-        if (!app.folderEntries.empty()) {
-          std::size_t index = app.folderCursor.current();
-          if (index == 0) {
-            addToQueue(app, app.browseFolder);
-          } else if (index - 1 < app.folderEntries.size()) {
-            addToQueue(app, app.folderEntries[index - 1]);
-          }
-        }
-      } else if (key == KeyEnter || key == 'l') {
-        if (!app.folderEntries.empty()) {
-          std::size_t index = app.folderCursor.current();
-          if (index == 0) {
-            playFolder(app, app.browseFolder, true);
-          } else if (index - 1 < app.folderEntries.size()) {
-            fs::path chosen = app.folderEntries[index - 1];
-            if (fs::is_directory(chosen, ec)) {
-              app.browseFolder = chosen;
-              app.folderEntries = directoryEntries(chosen);
-              app.folderCursor = selection{};
+        } else if (key == 'p') {
+          if (!app.folderEntries.empty()) {
+            std::size_t index = app.folderCursor.current();
+            if (index > 0 && index - 1 < app.folderEntries.size() &&
+                fs::is_directory(app.folderEntries[index - 1], ec)) {
+              playFolder(app, app.folderEntries[index - 1], true);
             } else {
-              playSongFromFolder(app, chosen);
+              playFolder(app, app.browseFolder, true);
+            }
+          }
+        } else if (key == 'e') {
+          if (!app.folderEntries.empty()) {
+            std::size_t index = app.folderCursor.current();
+            if (index == 0) {
+              addToQueue(app, app.browseFolder);
+            } else if (index - 1 < app.folderEntries.size()) {
+              addToQueue(app, app.folderEntries[index - 1]);
+            }
+            app.songQueue.save(queueFile.string());
+          }
+        } else if (key == KeyEnter || key == 'l') {
+          if (!app.folderEntries.empty()) {
+            std::size_t index = app.folderCursor.current();
+            if (index == 0) {
+              playFolder(app, app.browseFolder, true);
+            } else if (index - 1 < app.folderEntries.size()) {
+              fs::path chosen = app.folderEntries[index - 1];
+              if (fs::is_directory(chosen, ec)) {
+                app.browseFolder = chosen;
+                app.folderEntries = directoryEntries(chosen);
+                app.folderCursor = selection{};
+              } else {
+                playSongFromFolder(app, chosen);
+              }
             }
           }
         }
+      } else if (app.tab == AppTab::Queue) {
+        if ((key == 'r' || key == 'd') && !app.songQueue.empty()) {
+          std::size_t index = app.queueCursor.current();
+          if (index < app.songQueue.size())
+            app.songQueue.remove(index);
+          app.queueCursor = selection{};
+          app.songQueue.save(queueFile.string());
+        } else if (key == 'c') {
+          app.songQueue.clear();
+          app.queueCursor = selection{};
+          app.songQueue.save(queueFile.string());
+        } else if ((key == KeyEnter || key == 'l') && !app.songQueue.empty()) {
+          std::size_t index = app.queueCursor.current();
+          if (index < app.songQueue.size())
+            playFromPlaylist(app, queueAsList(app.songQueue), index);
+        }
+      } else if (app.tab == AppTab::Search) {
+        if (key == 'e' && !app.searchResults.empty()) {
+          std::size_t index = app.searchCursor.current();
+          if (index < app.searchResults.size()) {
+            addToQueue(app, app.searchResults[index]);
+            app.songQueue.save(queueFile.string());
+          }
+        } else if (key == KeyEnter && !app.searchResults.empty()) {
+          std::size_t index = app.searchCursor.current();
+          if (index < app.searchResults.size())
+            playSongFromFolder(app, app.searchResults[index]);
+        }
+      } else if (app.tab == AppTab::Player) {
+        if (key == 'e' && app.hasCurrentSong) {
+          addToQueue(app, app.currentSong);
+          app.songQueue.save(queueFile.string());
+        }
       }
-    } else if (app.tab == AppTab::Queue) {
-      if ((key == 'r' || key == 'd') && !app.songQueue.empty()) {
-        std::size_t index = app.queueCursor.current();
-        if (index < app.songQueue.size())
-          app.songQueue.remove(index);
-        app.queueCursor = selection{};
-      } else if (key == 'c') {
-        app.songQueue.clear();
-        app.queueCursor = selection{};
-      } else if ((key == KeyEnter || key == 'l') && !app.songQueue.empty()) {
-        std::size_t index = app.queueCursor.current();
-        if (index < app.songQueue.size())
-          playFromPlaylist(app, queueAsList(app.songQueue), index);
-      }
-    } else if (app.tab == AppTab::Search) {
-      if (key == 'e' && !app.searchResults.empty()) {
-        std::size_t index = app.searchCursor.current();
-        if (index < app.searchResults.size())
-          addToQueue(app, app.searchResults[index]);
-      } else if (key == KeyEnter && !app.searchResults.empty()) {
-        std::size_t index = app.searchCursor.current();
-        if (index < app.searchResults.size())
-          playSongFromFolder(app, app.searchResults[index]);
-      }
-    } else if (app.tab == AppTab::Player) {
-      if (key == 'e' && app.hasCurrentSong)
-        addToQueue(app, app.currentSong);
     }
-
-    app.songQueue.save(queueFile.string());
   }
 
   clearTerminalCover();
   app.player.stop();
   app.songQueue.save(queueFile.string());
+  saveStats(app);
   return 0;
 }
