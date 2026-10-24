@@ -67,6 +67,11 @@ bool kittyImageDrawn = false;
 std::string lastDrawnKittyCover;
 int lastTermRows = 0;
 int lastTermCols = 0;
+// Set when the song changes while an image is on screen. The actual "delete
+// image" command is sent later, from drawConfirmedKittyCover(), because
+// updateCacheIfNeeded() can be called while main.cpp is capturing std::cout
+// into a string, and anything printed then never reaches the terminal.
+bool pendingKittyClear = false;
 
 void updateCacheIfNeeded(const std::string &songPath) {
   if (songPath == cachedSongPath)
@@ -75,7 +80,8 @@ void updateCacheIfNeeded(const std::string &songPath) {
   cachedSongPath = songPath;
   cachedCoverPath = resolveCoverArt(songPath);
   cachedAnsiArt.clear();
-  clearTerminalCover();
+  if (kittyImageDrawn)
+    pendingKittyClear = true;
 
   if (!cachedCoverPath.empty() && !isKittyTerminal() && hasCommand("chafa")) {
     std::string cmd = "chafa --format symbols -s 20x10 " +
@@ -141,6 +147,7 @@ void clearTerminalCover() {
     std::cout << "\033_Ga=d,d=A,q=2\033\\" << std::flush;
   }
   kittyImageDrawn = false;
+  pendingKittyClear = false;
   lastDrawnKittyCover.clear();
 }
 
@@ -151,10 +158,9 @@ void renderPlayerCover(const std::string &songPath, bool showArt,
 
   updateCacheIfNeeded(songPath);
 
-  if (cachedCoverPath.empty()) {
-    std::cout << "  \033[90m[No embedded or folder cover art found]\033[0m\n";
+  // No cover: print nothing (blank area) instead of a text message.
+  if (cachedCoverPath.empty())
     return;
-  }
 
   if (isKittyTerminal()) {
     // Exactly 10 lines to match the bigger 20x10 image height
@@ -176,6 +182,16 @@ void drawConfirmedKittyCover(const std::string &songPath, bool showArt,
   }
 
   updateCacheIfNeeded(songPath);
+
+  // The song changed: remove the previous song's picture now, even if the new
+  // song has no cover at all (otherwise the old picture stays on screen).
+  if (pendingKittyClear) {
+    if (isKittyTerminal())
+      std::cout << "\033_Ga=d,d=A,q=2\033\\" << std::flush;
+    kittyImageDrawn = false;
+    lastDrawnKittyCover.clear();
+    pendingKittyClear = false;
+  }
 
   if (cachedCoverPath.empty() || !isKittyTerminal())
     return;
