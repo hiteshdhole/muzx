@@ -947,38 +947,18 @@ const char *subBlockGlyph(int eighths) {
   return kBlocks[std::clamp(eighths, 0, 8)];
 }
 
-// Number of visible columns in a line, ignoring ANSI colour codes.
-std::size_t visibleWidth(const std::string &text, bool *hasEscape = nullptr) {
-  std::size_t width = 0;
-  for (std::size_t i = 0; i < text.size(); ++i) {
-    const unsigned char c = static_cast<unsigned char>(text[i]);
-    if (c == 0x1B) {
-      if (hasEscape)
-        *hasEscape = true;
-      if (i + 1 < text.size() && text[i + 1] == '[') {
-        i += 2;
-        while (i < text.size() && !(text[i] >= 0x40 && text[i] <= 0x7E))
-          ++i;
-      }
-      continue;
-    }
-    if ((c & 0xC0) != 0x80)
-      ++width;
-  }
-  return width;
-}
-
-// Keeps a cover-area line inside the columns left of the visualizer. The
-// plain-text placeholder ("[No embedded or folder cover]") is longer than that
-// and used to be cut off by the bars, so it is replaced by a short one.
+// The cover code prints a text placeholder such as
+// "[No embedded or folder cover]" when a song has no picture. It is wider than
+// the space left of the visualizer, so the bars cut it off. Show nothing
+// instead: any placeholder line is replaced by an empty line.
+// (Real cover rows never contain these words, so they are left untouched.)
 std::string fitCoverLine(const std::string &line) {
-  const std::size_t maxCols = static_cast<std::size_t>(kVisColumnWithArt) - 2;
-  bool hasEscape = false;
-  if (visibleWidth(line, &hasEscape) <= maxCols)
-    return line;
-  if (!hasEscape)
-    return "[No cover art]";
-  return line; // real art rows are already sized by the cover renderer
+  const std::string lower = lowerCase(line);
+  if (lower.find("no embedded") != std::string::npos ||
+      lower.find("folder cover") != std::string::npos ||
+      lower.find("no cover") != std::string::npos)
+    return "";
+  return line;
 }
 
 // The block above the song info: album art on the left, spectrum bars on the
@@ -1368,9 +1348,22 @@ void drawScreen(const AppState &app) {
   // The album art itself is an image sent separately (Kitty graphics
   // protocol); it is drawn on top of the text we just printed.
   static const std::string kNoSong;
-  drawConfirmedKittyCover(app.hasCurrentSong ? app.currentSong : kNoSong,
-                          app.showAlbumArt && app.tab == AppTab::Player,
-                          app.tab == AppTab::Player);
+  const std::string &coverSong = app.hasCurrentSong ? app.currentSong : kNoSong;
+  const bool wantCover = app.showAlbumArt && app.tab == AppTab::Player;
+
+  // The cover code only draws an image when a song HAS one; it never removes
+  // the previous picture. So when the song (or the art on/off state) changes,
+  // delete the old image first. A song without a cover then shows nothing
+  // instead of the previous song's picture.
+  static std::string lastCoverSong;
+  static bool lastWantCover = false;
+  if (coverSong != lastCoverSong || wantCover != lastWantCover) {
+    clearTerminalCover();
+    lastCoverSong = coverSong;
+    lastWantCover = wantCover;
+  }
+
+  drawConfirmedKittyCover(coverSong, wantCover, app.tab == AppTab::Player);
 }
 
 // ---------------------------------------------------------------------------
