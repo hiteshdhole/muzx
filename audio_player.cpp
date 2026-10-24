@@ -1,10 +1,16 @@
 #include "audio_player.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -33,14 +39,59 @@ bool convertToCleanWav(const std::string &inputPath,
           std::filesystem::file_size(outputWav, ec) > 4096);
 }
 
+// Opens `path` with SFML's decoder inside a short-lived CHILD process and
+// reports whether that was safe.
+//
+// Why: for some mp3 files SFML's mp3 reader corrupts the heap while opening
+// ("double free or corruption" -> abort). That kills the whole process and
+// cannot be caught with try/catch. In a child process the same crash only
+// kills the child, so the player can see it coming and use the ffmpeg
+// fallback for that file instead.
+//   true  = the child opened the file (or cleanly reported "cannot open")
+//   false = the child crashed or hung, so this file is skipped
+bool sfmlCanOpenSafely(const std::string &path) {
+  std::cout.flush();
+  const pid_t pid = fork();
+  if (pid < 0)
+    return true; // cannot probe: behave like before
+
+  if (pid == 0) {
+    // ---- child ----
+    rlimit noCore{0, 0};
+    setrlimit(RLIMIT_CORE, &noCore); // a crash here must not dump core
+    const int devNull = open("/dev/null", O_WRONLY);
+    if (devNull >= 0) {
+      dup2(devNull, STDOUT_FILENO);
+      dup2(devNull, STDERR_FILENO);
+    }
+    signal(SIGALRM, SIG_DFL);
+    alarm(5); // a hang is treated like a crash
+    sf::InputSoundFile file;
+    const bool ok = file.openFromFile(path);
+    _exit(ok ? 0 : 3);
+  }
+
+  // ---- parent ----
+  int status = 0;
+  pid_t r;
+  do {
+    r = waitpid(pid, &status, 0);
+  } while (r < 0 && errno == EINTR);
+  if (r < 0)
+    return true;
+  return WIFEXITED(status) &&
+         (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 3);
+}
+
 } // namespace
 
 void audio_player::VisualMusic::onSeek(sf::Time timeOffset) {
   sf::Music::onSeek(timeOffset);
   const unsigned int rate = std::max(1U, getSampleRate());
   std::lock_guard<std::mutex> lock(ringMutex);
-  ringEndFrame = static_cast<std::int64_t>(timeOffset.asSeconds() *
-                                           static_cast<float>(rate));
+  ringEndFrame = std::max<std::int64_t>(
+      0, static_cast<std::int64_t>(timeOffset.asSeconds() *
+                                   static_cast<float>(rate)));
   ++seekEpoch;
 }
 
@@ -65,9 +116,10 @@ bool audio_player::VisualMusic::onGetData(Chunk &data) {
   std::lock_guard<std::mutex> lock(ringMutex);
   if (seekEpoch != epochBefore) {
     // A seek happened while decoding; resync to current playing offset
-    ringEndFrame = static_cast<std::int64_t>(
-        getPlayingOffset().asSeconds() *
-        static_cast<float>(std::max(1U, getSampleRate())));
+    ringEndFrame = std::max<std::int64_t>(
+        0, static_cast<std::int64_t>(
+               getPlayingOffset().asSeconds() *
+               static_cast<float>(std::max(1U, getSampleRate()))));
   }
 
   for (std::size_t f = 0; f < frames; ++f) {
@@ -166,6 +218,12 @@ bool audio_player::load(const std::string &filename) {
 
   static std::ostringstream nullStream;
   sf::err().rdbuf(nullStream.rdbuf());
+
+  // Only let SFML's own decoder touch the file if a child process survived
+  // opening it. A file that crashes (or hangs) the decoder is skipped: load()
+  // returns false and the caller moves on to the next song.
+  if (!sfmlCanOpenSafely(filename))
+    return false;
 
   bool opened = false;
   try {
