@@ -19,6 +19,7 @@
 #include "audio_player.hpp"
 #include "config.hpp"
 #include "cover.hpp"
+#include "lyrics.hpp"
 #include "queue.hpp"
 #include "selection.hpp"
 #include <algorithm>
@@ -36,6 +37,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <streambuf>
@@ -469,6 +471,8 @@ std::string fileName(const std::string &path) {
 // Application state
 // ---------------------------------------------------------------------------
 
+enum class LyricsMode { Off, Right, Bottom }; // "L" cycles these
+
 enum class AppTab {
   Player = 0,
   Folders = 1,
@@ -501,6 +505,13 @@ struct AppState {
   bool shuffle = false;
   bool showAlbumArt = false;
   bool showVisualizer = false;
+  LyricsMode lyricsMode = LyricsMode::Right; // "L": Off -> Right -> Bottom
+  bool lyricsAutoGen = false;    // "A": generate lyrics when none exist
+  bool lyricsAutoTried = false;  // auto-generation already tried for this song
+  bool whisperAvailable = false; // a whisper command was found
+  std::chrono::steady_clock::time_point lyricsSongSince{};
+  lyrics::Manager lyricsMgr; // finds lyrics on a background thread
+  std::string lyricsSong;    // song the lyrics were last requested for
 
   double sessionPlayedSeconds = 0.0;
   double totalPlayedSeconds = 0.0;
@@ -1125,7 +1136,8 @@ void drawPlayer(const AppState &app) {
 
   std::cout << kMuted << "  Space Play/Pause  |  ←/→ Seek  |  i Art ("
             << (app.showAlbumArt ? "ON" : "OFF") << ")  |  v Vis ("
-            << (app.showVisualizer ? "ON" : "OFF") << ")\n"
+            << (app.showVisualizer ? "ON" : "OFF") << ")  |  L Lyrics ("
+            << (app.lyricsMode != LyricsMode::Off ? "ON" : "OFF") << ")\n"
             << kReset;
 }
 
@@ -1248,6 +1260,9 @@ void drawKeybindings() {
   row("s", "Toggle shuffle");
   row("i", "Toggle Album Art");
   row("v", "Toggle Audio Visualizer");
+  row("L", "Lyrics: right panel / below / off");
+  row("G", "Generate lyrics with Whisper (G again cancels)");
+  row("A", "Auto-generate lyrics when none exist");
   row("+ / -", "Adjust volume");
   row("x", "Stop playback");
 
@@ -1267,6 +1282,395 @@ void drawKeybindings() {
   row("c", "Clear Queue");
   row("/", "Search songs by filename");
   row("q / Esc", "Quit MUZX");
+}
+
+// ---------------------------------------------------------------------------
+// Lyrics panel (right side of the Player tab)
+//
+// lyrics.cpp finds the lyrics on a background thread. Here we only DRAW them:
+// the line that is being sung is highlighted and kept in the middle, like
+// Spotify. Rows are positioned with absolute cursor codes ("\033[row;colH") on
+// top of the finished frame, so the rest of the layout is not touched.
+// ---------------------------------------------------------------------------
+
+constexpr int kLyricsMinCols = 101;         // narrower terminals: no panel
+constexpr double kLyricsLeadSeconds = 0.25; // highlight a line a bit early
+constexpr const char *kLyricCurrent = "\033[1;95m"; // bold pink
+constexpr const char *kLyricNear = "\033[37m";      // light grey
+
+int terminalCols() {
+  winsize w{};
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
+    return static_cast<int>(w.ws_col);
+  return 80;
+}
+
+// Reads one UTF-8 character at text[i]; returns how many bytes it uses.
+std::size_t decodeUtf8(const std::string &text, std::size_t i, char32_t &cp) {
+  const unsigned char c = static_cast<unsigned char>(text[i]);
+  std::size_t len = 1;
+  cp = c;
+  if (c >= 0xF0) {
+    len = 4;
+    cp = c & 0x07;
+  } else if (c >= 0xE0) {
+    len = 3;
+    cp = c & 0x0F;
+  } else if (c >= 0xC0) {
+    len = 2;
+    cp = c & 0x1F;
+  } else {
+    return 1;
+  }
+  if (i + len > text.size()) {
+    cp = 0xFFFD;
+    return 1;
+  }
+  for (std::size_t k = 1; k < len; ++k) {
+    const unsigned char n = static_cast<unsigned char>(text[i + k]);
+    if ((n & 0xC0) != 0x80) {
+      cp = 0xFFFD;
+      return 1;
+    }
+    cp = (cp << 6) | (n & 0x3F);
+  }
+  return len;
+}
+
+// Terminal columns a character occupies: Japanese/Chinese/Korean and emoji
+// take 2, combining marks take 0, everything else 1.
+int charColumns(char32_t cp) {
+  if (cp == 0 || (cp >= 0x0300 && cp <= 0x036F) ||
+      (cp >= 0x200B && cp <= 0x200F) || (cp >= 0xFE00 && cp <= 0xFE0F))
+    return 0;
+  if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) ||
+      (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+      (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+      (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+      (cp >= 0x20000 && cp <= 0x3FFFD))
+    return 2;
+  return 1;
+}
+
+// Splits a lyric line into rows that fit `width` columns. Breaks at spaces
+// when possible; text without spaces (Japanese) is broken between characters.
+std::vector<std::string> wrapLyric(const std::string &text, std::size_t width) {
+  std::vector<std::string> rows;
+  if (width == 0)
+    return rows;
+
+  std::string cur;
+  std::size_t curW = 0;
+  std::size_t lastSpaceByte =
+      std::string::npos; // position of last space in cur
+  std::size_t widthBeforeSpace = 0;
+
+  for (std::size_t i = 0; i < text.size();) {
+    char32_t cp = 0;
+    const std::size_t len = decodeUtf8(text, i, cp);
+    const std::size_t w = static_cast<std::size_t>(charColumns(cp));
+
+    if (cp == U' ' && curW == 0) { // no leading spaces on a row
+      i += len;
+      continue;
+    }
+    if (curW + w > width) {
+      if (lastSpaceByte != std::string::npos && cp != U' ') {
+        rows.push_back(cur.substr(0, lastSpaceByte)); // break at the space
+        cur = cur.substr(lastSpaceByte + 1);
+        curW = curW - widthBeforeSpace - 1;
+      } else {
+        rows.push_back(cur); // no space to break at: break here
+        cur.clear();
+        curW = 0;
+      }
+      lastSpaceByte = std::string::npos;
+      if (cp == U' ') {
+        i += len;
+        continue;
+      }
+    }
+    if (cp == U' ') {
+      lastSpaceByte = cur.size();
+      widthBeforeSpace = curW;
+    }
+    cur.append(text, i, len);
+    curW += w;
+    i += len;
+  }
+  if (!cur.empty())
+    rows.push_back(cur);
+  if (rows.empty())
+    rows.emplace_back();
+  return rows;
+}
+
+// Terminal columns taken by a whole string (see charColumns above).
+std::size_t displayWidth(const std::string &text) {
+  std::size_t width = 0;
+  for (std::size_t i = 0; i < text.size();) {
+    char32_t cp = 0;
+    i += decodeUtf8(text, i, cp);
+    width += static_cast<std::size_t>(charColumns(cp));
+  }
+  return width;
+}
+
+// Cuts a string to at most `maxCols` terminal columns (never inside a
+// character).
+std::string clipColumns(const std::string &text, std::size_t maxCols) {
+  std::string out;
+  std::size_t cols = 0;
+  for (std::size_t i = 0; i < text.size();) {
+    char32_t cp = 0;
+    const std::size_t len = decodeUtf8(text, i, cp);
+    const std::size_t w = static_cast<std::size_t>(charColumns(cp));
+    if (cols + w > maxCols)
+      break;
+    out.append(text, i, len);
+    cols += w;
+    i += len;
+  }
+  return out;
+}
+
+// Asks the lyrics thread for the lyrics of the song that is playing now, and
+// starts automatic generation when it is switched on ("A"). Called every
+// frame; it only does work when the song changes.
+void updateLyricsRequest(AppState &app) {
+  if (app.lyricsMode == LyricsMode::Off || !app.hasCurrentSong)
+    return;
+
+  const auto now = std::chrono::steady_clock::now();
+  float duration = app.player.getDuration().asSeconds();
+  if (!std::isfinite(duration) || duration < 0.0F)
+    duration = 0.0F;
+
+  if (app.currentSong != app.lyricsSong) {
+    app.lyricsSong = app.currentSong;
+    app.lyricsSongSince = now;
+    app.lyricsAutoTried = false;
+    app.lyricsMgr.request(app.currentSong, static_cast<double>(duration));
+    return;
+  }
+
+  // Automatic generation: only for a song that has been playing for a few
+  // seconds (so skipping through songs does not start and stop Whisper over
+  // and over), and only once per song.
+  if (app.lyricsAutoGen && !app.lyricsAutoTried && app.whisperAvailable &&
+      app.lyricsMgr.state() == lyrics::State::NotFound &&
+      now - app.lyricsSongSince > std::chrono::seconds(5)) {
+    app.lyricsAutoTried = true;
+    app.lyricsMgr.generate(app.currentSong, static_cast<double>(duration));
+  }
+}
+
+// Where the lyrics are drawn.
+struct LyricsBox {
+  int col = 1;      // left column (1-based)
+  int titleRow = 1; // row of the "LYRICS" title
+  int top = 1;      // first lyric row
+  int height = 0;   // number of lyric rows
+  std::size_t width = 0;
+  bool centered = false; // bottom placement centres every line
+};
+
+// Works out the box for the current placement. Returns false when it does not
+// fit on the screen.
+//   Right  = the empty area to the right of the player
+//   Bottom = the empty area below the player (needs a few free rows)
+bool lyricsBox(const AppState &app, int rows, int cols, int usedRows,
+               LyricsBox &box) {
+  LyricsMode mode = app.lyricsMode;
+  if (mode == LyricsMode::Off)
+    return false;
+  if (mode == LyricsMode::Right && cols < kLyricsMinCols)
+    mode = LyricsMode::Bottom; // too narrow for a side panel
+
+  if (mode == LyricsMode::Right) {
+    box.col = cols >= 140 ? 88 : 82;
+    box.width = static_cast<std::size_t>(cols - box.col - 1);
+    box.titleRow = 4;
+    box.top = 5;
+    box.height = std::min(std::clamp(rows - 8, 8, 24), rows - box.top + 1);
+    box.centered = false;
+  } else {
+    box.col = 3;
+    box.width = static_cast<std::size_t>(std::max(0, std::min(cols - 4, 90)));
+    box.titleRow = usedRows + 2;
+    box.top = usedRows + 3;
+    box.height = std::min(rows - box.top + 1, 9);
+    box.centered = true;
+  }
+  return box.height >= 3 && box.width >= 12;
+}
+
+// Builds the escape codes that draw the lyrics. Returns "" when they should
+// not be shown (other tab, switched off, nothing playing, no room).
+std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
+  if (app.tab != AppTab::Player || !app.hasCurrentSong)
+    return "";
+  LyricsBox box;
+  if (!lyricsBox(app, rows, cols, usedRows, box))
+    return "";
+
+  const std::size_t width = box.width;
+  const int top = box.top;
+  const int height = box.height;
+  const int mid = height / 2;
+
+  // Moves to a row of the box and clears the rest of that screen row.
+  auto at = [&](int row) {
+    return "\033[" + std::to_string(row) + ";" + std::to_string(box.col) +
+           "H\033[K";
+  };
+  // One line of text, centred when the box is centred.
+  auto put = [&](int row, const std::string &color, const std::string &text) {
+    std::string line = at(row);
+    if (box.centered) {
+      const std::size_t w = displayWidth(text);
+      if (w < width)
+        line += std::string((width - w) / 2, ' ');
+    }
+    return line + color + text + kReset;
+  };
+
+  const lyrics::State state = app.lyricsMgr.state();
+  const std::shared_ptr<const lyrics::Result> result = app.lyricsMgr.result();
+
+  // Title: "LYRICS  <source>   <key hints>". The hints are shortened or left
+  // out so the line never runs past the right edge (the terminal would pile
+  // the last characters up in the final column).
+  std::string detail;
+  if (result)
+    detail = "  " + result->source + (result->synced ? "" : "  (not synced)");
+  const std::string autoState = app.lyricsAutoGen ? "ON" : "OFF";
+  const std::string hints[] = {"   L move/hide  |  G generate  |  A auto (" +
+                                   autoState + ")",
+                               "   [L] [G] [A]", ""};
+  const std::size_t titleRoom = width > 6 ? width - 6 : 0;
+  for (const std::string &hint : hints) {
+    if (displayWidth(detail + hint) <= titleRoom) {
+      detail += hint;
+      break;
+    }
+  }
+  std::string out = at(box.titleRow) + kPurpleBold + "LYRICS" + kReset +
+                    kMuted + clipColumns(detail, titleRoom) + kReset;
+
+  // No lyrics (yet): show a short message in the middle of the box.
+  if (!result) {
+    std::string message;
+    if (state == lyrics::State::Generating) {
+      const int secs = static_cast<int>(app.lyricsMgr.generatingSeconds());
+      char clock[16];
+      std::snprintf(clock, sizeof(clock), "%d:%02d", secs / 60, secs % 60);
+      message = "Generating lyrics with Whisper (" + lyrics::generatorModel() +
+                ")...  " + clock +
+                "   Press G to cancel. A song can take a few minutes; the "
+                "first run also downloads the model.";
+    } else if (state == lyrics::State::NotFound) {
+      if (app.whisperAvailable && app.lyricsAutoGen && !app.lyricsAutoTried)
+        message = "No lyrics found. Whisper starts generating them in a few "
+                  "seconds (press G to start now).";
+      else if (app.whisperAvailable)
+        message = "No lyrics found. Press G to generate them with Whisper, or "
+                  "A to do it automatically for every song.";
+      else
+        message = "No lyrics found. Put a .lrc file with the same name next to "
+                  "the song, or install Whisper to generate lyrics: pip "
+                  "install openai-whisper";
+      const std::string error = app.lyricsMgr.lastError();
+      if (!error.empty())
+        message += "  (" + error + ")";
+    } else {
+      message = "Searching for lyrics...";
+    }
+    const std::vector<std::string> parts = wrapLyric(message, width);
+    int row = top + std::max(0, mid - static_cast<int>(parts.size()) / 2);
+    for (const std::string &part : parts) {
+      if (row >= top + height)
+        break;
+      out += put(row++, kMuted, part);
+    }
+    return out;
+  }
+
+  struct Row {
+    int line;
+    std::string text;
+  };
+  std::vector<Row> display;
+  const auto &lines = result->lines;
+  const int count = static_cast<int>(lines.size());
+  int curLine = -1;
+  long startRow = 0;
+
+  if (result->synced) {
+    const double position =
+        static_cast<double>(app.player.getPlayingOffset().asSeconds()) +
+        kLyricsLeadSeconds;
+    // The line being sung = the last one whose time has already passed.
+    const auto it = std::upper_bound(
+        lines.begin(), lines.end(), position,
+        [](double p, const lyrics::Line &l) { return p < l.time; });
+    curLine = static_cast<int>(it - lines.begin()) - 1;
+
+    // Only lay out the lines around the current one.
+    const int focus = std::max(curLine, 0);
+    const int lo = std::max(0, focus - height);
+    const int hi = std::min(count, focus + height + 1);
+    long anchorRow = 0;
+    for (int i = lo; i < hi; ++i) {
+      std::string text = lines[static_cast<std::size_t>(i)].text;
+      if (text.empty() && i == curLine)
+        text = "\xE2\x99\xAA"; // ♪ during an instrumental break
+      if (i == focus)
+        anchorRow = static_cast<long>(display.size());
+      for (std::string &part : wrapLyric(text, width))
+        display.push_back({i, std::move(part)});
+    }
+    startRow = anchorRow - mid; // keep the current line in the middle
+  } else {
+    // Unsynced: plain list that slowly scrolls as the song progresses.
+    const int limit = std::min(count, 500);
+    for (int i = 0; i < limit; ++i) {
+      for (std::string &part :
+           wrapLyric(lines[static_cast<std::size_t>(i)].text, width))
+        display.push_back({i, std::move(part)});
+    }
+    const double duration =
+        static_cast<double>(app.player.getDuration().asSeconds());
+    const double position =
+        static_cast<double>(app.player.getPlayingOffset().asSeconds());
+    const long maxStart =
+        std::max(0L, static_cast<long>(display.size()) - height);
+    if (duration > 1.0 && std::isfinite(duration) && std::isfinite(position))
+      startRow = static_cast<long>(
+          std::lround(std::clamp(position / duration, 0.0, 1.0) *
+                      static_cast<double>(maxStart)));
+  }
+
+  for (int r = 0; r < height; ++r) {
+    const long idx = startRow + r;
+    if (idx < 0 || idx >= static_cast<long>(display.size()))
+      continue;
+    const Row &row = display[static_cast<std::size_t>(idx)];
+    if (row.text.empty())
+      continue;
+
+    const char *color = "";
+    if (result->synced) {
+      if (row.line == curLine)
+        color = kLyricCurrent;
+      else if (std::abs(row.line - curLine) <= 1)
+        color = kLyricNear;
+      else
+        color = kMuted;
+    }
+    out += put(top + r, color, row.text);
+  }
+  return out;
 }
 
 // Builds one complete frame and writes it to the terminal.
@@ -1304,7 +1708,8 @@ void drawScreen(const AppState &app) {
     std::cout
         << kMuted
         << "------------------------------------------------------------\n"
-        << "  Tab/1-6 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  "
+        << "  Tab/1-6 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  L "
+           "Lyrics  |  "
            "q/Esc Quit"
         << kReset;
     std::cout.flush();
@@ -1343,6 +1748,10 @@ void drawScreen(const AppState &app) {
 
   // "\033[J" clears anything left below the frame.
   output += "\033[J\033[H";
+
+  // Lyrics go on top of the finished frame, in the same write (no flicker).
+  output += lyricsPanel(app, maxRows, terminalCols(), rowCount);
+  output += "\033[H";
   std::cout << output << std::flush;
 
   // The album art itself is an image sent separately (Kitty graphics
@@ -1419,6 +1828,32 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   }
   if (key == 'v') {
     app.showVisualizer = !app.showVisualizer;
+    return KeyResult::Handled;
+  }
+  if (key == 'L') {
+    // Off -> Right panel -> Below the player -> Off
+    app.lyricsMode =
+        app.lyricsMode == LyricsMode::Off
+            ? LyricsMode::Right
+            : (app.lyricsMode == LyricsMode::Right ? LyricsMode::Bottom
+                                                   : LyricsMode::Off);
+    return KeyResult::Handled;
+  }
+  if (key == 'G' || key == 'g') {
+    if (app.lyricsMode == LyricsMode::Off) {
+      app.lyricsMode = LyricsMode::Right; // show the lyrics area first
+    } else if (app.lyricsMgr.state() == lyrics::State::Generating) {
+      app.lyricsMgr.cancelGenerate(); // G again = cancel
+    } else if (app.hasCurrentSong) {
+      app.whisperAvailable = !lyrics::generatorCommand().empty();
+      app.lyricsMgr.generate(app.currentSong, 0.0);
+    }
+    return KeyResult::Handled;
+  }
+  if (key == 'A') {
+    app.lyricsAutoGen = !app.lyricsAutoGen;
+    app.lyricsAutoTried = false;
+    app.whisperAvailable = !lyrics::generatorCommand().empty();
     return KeyResult::Handled;
   }
   if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
@@ -1608,6 +2043,17 @@ int run() {
   app.songQueue.load(queueFile.string());
   loadStats(app);
 
+  // Lyrics are cached in the same folder. MUZX_LYRICS_ONLINE=0 turns the
+  // web lookup off (local .lrc files and tags still work).
+  app.lyricsMgr.setCacheDir(configDirectory);
+  app.whisperAvailable = !lyrics::generatorCommand().empty();
+  if (const char *autogen = std::getenv("MUZX_LYRICS_AUTOGEN");
+      autogen && std::string(autogen) == "1")
+    app.lyricsAutoGen = true;
+  if (const char *online = std::getenv("MUZX_LYRICS_ONLINE");
+      online && std::string(online) == "0")
+    app.lyricsMgr.setOnlineEnabled(false);
+
   installSignalHandlers();
   TerminalSession terminal; // from here on the screen belongs to us
   bool running = true;
@@ -1638,6 +2084,7 @@ int run() {
     }
 
     // 2. draw, then wait ~16 ms (about 60 frames per second)
+    updateLyricsRequest(app); // start a lyrics lookup when the song changed
     drawScreen(app);
     std::this_thread::sleep_for(std::chrono::milliseconds(kFrameMs));
 
