@@ -804,7 +804,15 @@ std::string lrclibBase() {
 // Downloads one URL. `transient` is set when it failed for a reason that says
 // nothing about the lyrics (no network, timeout), so we must not remember
 // "not found" for that song.
+// Set by the worker thread: returns true once the song this lookup is for was
+// skipped, so slow network steps can be abandoned.
+thread_local const std::function<bool()> *tlsStale = nullptr;
+
 std::string fetchUrl(const std::string &url, bool &transient) {
+  if (tlsStale && (*tlsStale)()) { // skipped: do not ask the server any more
+    transient = true;
+    return "";
+  }
   const CommandOutput out = runCommand("curl -s -f -m 6 -A 'muzx/1.0' -- " +
                                        shellQuote(url) + " 2>/dev/null");
   if (out.status == 0)
@@ -813,6 +821,8 @@ std::string fetchUrl(const std::string &url, bool &transient) {
     transient = true;
   return "";
 }
+
+std::string findExecutable(const std::string &name); // defined below
 
 // "Main Agar Saamne - Abhijeet" -> {"Main Agar Saamne", "Abhijeet"}
 // (download sites join artist and title with " - ").
@@ -868,6 +878,15 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
     return false;
   };
 
+  // The network is down (or this lookup was abandoned): stop asking, but keep
+  // plain lyrics if one of the earlier answers had them.
+  auto giveUp = [&]() -> bool {
+    if (!havePlain)
+      return false;
+    out = std::move(plainFallback);
+    return true;
+  };
+
   // 1) exact match by tags
   if (!tags.title.empty() && !tags.artist.empty()) {
     std::string url = base + "/api/get?track_name=" + urlEncode(tags.title) +
@@ -879,6 +898,8 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
              std::to_string(static_cast<long>(std::lround(duration)));
     if (consider(fetchUrl(url, transient), false))
       return true;
+    if (transient)
+      return giveUp();
   }
   // 2) search by title + artist
   if (!tags.artist.empty()) {
@@ -886,6 +907,8 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
                               "&artist_name=" + urlEncode(tags.artist),
                           transient)))
       return true;
+    if (transient)
+      return giveUp();
   }
   // 3) free-text searches (work with just a cleaned-up file name): the whole
   // name first, then each " - " part on its own.
@@ -907,6 +930,8 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
   for (const std::string &q : queries) {
     if (consider(fetchUrl(base + "/api/search?q=" + urlEncode(q), transient)))
       return true;
+    if (transient)
+      return giveUp();
   }
 
   if (havePlain) {
@@ -973,6 +998,60 @@ bool recentlyNotFound(const fs::path &cacheDir, const std::string &key) {
   return (fs::file_time_type::clock::now() - t) < std::chrono::hours(72);
 }
 
+// Second online source: the `syncedlyrics` command-line tool (pipx install
+// syncedlyrics) searches Musixmatch, NetEase, Megalobiz and others for timed
+// lyrics. It is optional; without it this step is skipped.
+bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
+                        double duration, const fs::path &cacheDir, Result &out,
+                        bool &transient) {
+  const std::string bin = findExecutable("syncedlyrics");
+  if (bin.empty())
+    return false;
+  if (tlsStale && (*tlsStale)()) {
+    transient = true;
+    return false;
+  }
+
+  const std::string title = tags.title.empty() ? fallbackTitle : tags.title;
+  std::string term;
+  for (const std::string &part : splitDashes(title))
+    term += (term.empty() ? "" : " ") + part;
+  if (term.empty())
+    term = title;
+  term = trimCopy(tags.artist + " " + term);
+  if (term.empty())
+    return false;
+
+  std::error_code ec;
+  const fs::path base =
+      cacheDir.empty() ? fs::temp_directory_path(ec) : cacheDir / "lyrics";
+  const fs::path workDir =
+      base / ("sl-" + std::to_string(getpid()) + "-" + hexHash(term));
+  fs::create_directories(workDir, ec);
+  const fs::path outPath = workDir / "out.lrc";
+
+  // `timeout` keeps a stuck provider from blocking the lookup thread.
+  const CommandOutput run = runCommand(
+      "timeout 20 " + shellQuote(bin) + " -o " + shellQuote(outPath.string()) +
+      " -- " + shellQuote(term) + " </dev/null 2>/dev/null");
+  bool found = false;
+  if (run.status != 0) {
+    transient = true; // tool crashed, timed out or no network
+  } else if (const auto data = readFile(outPath)) {
+    Result r = parseLrc(*data);
+    // A version of the song with a different length would be out of sync.
+    const bool tooLong = duration > 0.0 && !r.lines.empty() &&
+                         r.lines.back().time > duration + 15.0;
+    if (!r.lines.empty() && !tooLong) {
+      r.source = "syncedlyrics";
+      out = std::move(r);
+      found = true;
+    }
+  }
+  fs::remove_all(workDir, ec);
+  return found;
+}
+
 std::optional<Result> findLyrics(const std::string &songPath, double duration,
                                  const fs::path &cacheDir, bool online) {
   if (auto r = loadSidecar(songPath))
@@ -1000,8 +1079,18 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
   if (online && !(!cacheDir.empty() && recentlyNotFound(cacheDir, key))) {
     Result found;
     bool transient = false;
-    if (lookupOnline(tags, cleanTitleFromFilename(songPath), duration, found,
-                     transient)) {
+    const std::string cleaned = cleanTitleFromFilename(songPath);
+    bool have = lookupOnline(tags, cleaned, duration, found, transient);
+    if ((!have || !found.synced) &&
+        !transient) { // nothing, or only untimed lyrics: try harder
+      Result better;
+      if (lookupSyncedlyrics(tags, cleaned, duration, cacheDir, better,
+                             transient)) {
+        found = std::move(better);
+        have = true;
+      }
+    }
+    if (have) {
       saveCache(cacheDir, key, found);
       return found;
     }
@@ -1143,14 +1232,25 @@ std::string lastLineOf(const fs::path &path) {
   const auto data = readFile(path);
   if (!data)
     return "";
-  std::string last;
+  // Prefer the last line that names an error (the end of a Python traceback);
+  // otherwise the last non-empty line.
+  std::string last, lastError;
   for (const std::string &line : splitLines(*data)) {
-    if (!trimCopy(line).empty())
-      last = trimCopy(line);
+    const std::string t = trimCopy(line);
+    if (t.empty())
+      continue;
+    last = t;
+    const std::string lower = lowerCopy(t);
+    if (lower.find("error") != std::string::npos ||
+        lower.find("exception") != std::string::npos ||
+        lower.find("no such file") != std::string::npos ||
+        lower.find("not found") != std::string::npos)
+      lastError = t;
   }
-  if (last.size() > 100)
-    last.resize(100);
-  return sanitize(last);
+  std::string pick = lastError.empty() ? last : lastError;
+  if (pick.size() > 100)
+    pick.resize(100);
+  return sanitize(pick);
 }
 
 // Runs `whisper` on the song. It is started in its own process group, at low
@@ -1267,12 +1367,29 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
   }
   onPid(0);
+  // The UI kills the process itself when you cancel or skip the song, so it can
+  // look like a crash from here; that must not be reported as a failure.
+  if (killedBecause.empty() && cancelled())
+    killedBecause = "cancelled";
+
+  // On a real failure, keep everything Whisper printed (plus the command that
+  // was run) in whisper-error.log next to the lyrics cache.
+  auto keepLog = [&]() {
+    std::string text = "command:";
+    for (const std::string &a : args)
+      text += " '" + a + "'";
+    text += "\n\n";
+    if (const auto log = readFile(logPath))
+      text += *log;
+    writeFileAtomic(workDir.parent_path() / "whisper-error.log", text);
+  };
 
   if (!killedBecause.empty()) {
     out.error = killedBecause;
   } else if (!exited || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     const std::string reason = lastLineOf(logPath);
     out.error = "Whisper failed" + (reason.empty() ? "" : ": " + reason);
+    keepLog();
   } else {
     for (fs::directory_iterator it(workDir, ec), end; !ec && it != end;
          it.increment(ec)) {
@@ -1286,8 +1403,10 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
         }
       }
     }
-    if (!out.result)
+    if (!out.result) {
       out.error = "no lyrics detected (instrumental?)";
+      keepLog();
+    }
   }
   fs::remove_all(workDir, ec);
   return out;
@@ -1343,6 +1462,9 @@ struct Manager::Shared {
 
   // auto-generated lyrics
   bool generating = false;
+  bool pendingGenerate =
+      false; // start Whisper as soon as the search ends empty
+  std::string genModel, genLanguage;
   std::uint64_t genToken = 0; // bumped to cancel / invalidate a generation
   pid_t childPid = 0;         // the running whisper process, 0 if none
   std::chrono::steady_clock::time_point genStart;
@@ -1407,6 +1529,22 @@ void generatorMain(std::shared_ptr<Manager::Shared> sh, std::string songPath,
   }
 }
 
+// Starts Whisper for `songPath`. The caller holds the lock.
+void startGenerationLocked(const std::shared_ptr<Manager::Shared> &sh,
+                           const std::string &songPath) {
+  Manager::Shared &s = *sh;
+  s.generating = true;
+  s.pendingGenerate = false;
+  ++s.genToken;
+  s.state = State::Generating;
+  s.result.reset();
+  s.genStart = std::chrono::steady_clock::now();
+  s.lastError.clear();
+  std::thread(generatorMain, sh, songPath, s.genToken, s.cacheDir, s.genModel,
+              s.genLanguage)
+      .detach();
+}
+
 } // namespace
 
 namespace {
@@ -1433,12 +1571,18 @@ void workerMain(std::shared_ptr<Manager::Shared> sh) {
     const bool online = sh->online;
 
     lock.unlock();
+    const std::function<bool()> stale = [&]() {
+      std::lock_guard<std::mutex> guard(sh->m);
+      return sh->stop || sh->generation != gen;
+    };
+    tlsStale = &stale;
     std::optional<Result> found;
     try {
       found = findLyrics(req.path, req.duration, cacheDir, online);
     } catch (...) {
       found.reset();
     }
+    tlsStale = nullptr;
     lock.lock();
 
     if (gen == sh->generation) { // ignore answers for a song we left already
@@ -1448,7 +1592,10 @@ void workerMain(std::shared_ptr<Manager::Shared> sh) {
       } else {
         sh->result.reset();
         sh->state = State::NotFound;
+        if (sh->pendingGenerate) // G was pressed during the search
+          startGenerationLocked(sh, req.path);
       }
+      sh->pendingGenerate = false;
     }
   }
 }
@@ -1497,6 +1644,7 @@ void Manager::request(const std::string &songPath, double durationSeconds) {
   shared_->currentSong = songPath;
   ++shared_->generation;
   cancelGenerationLocked(*shared_);
+  shared_->pendingGenerate = false;
   shared_->lastError.clear();
   shared_->state = State::Loading;
   shared_->result.reset(); // never show the previous song's lyrics
@@ -1528,31 +1676,39 @@ bool Manager::generate(const std::string &songPath, double /*duration*/) {
 
   std::lock_guard<std::mutex> lock(shared_->m);
   Shared &s = *shared_;
-  if (songPath != s.currentSong || s.generating)
-    return false;
-  const bool redo = s.state == State::Ready && s.result &&
-                    startsWith(s.result->source, "generated");
-  if (s.state != State::NotFound && !redo)
+  if (songPath != s.currentSong || s.generating || s.pendingGenerate)
     return false;
   if (bin.empty()) {
     s.lastError = "Whisper is not installed";
     return false;
   }
+  s.genModel = model;
+  s.genLanguage = language;
 
-  s.generating = true;
-  ++s.genToken;
-  s.state = State::Generating;
-  s.result.reset();
-  s.genStart = std::chrono::steady_clock::now();
-  s.lastError.clear();
-  std::thread(generatorMain, shared_, songPath, s.genToken, s.cacheDir, model,
-              language)
-      .detach();
+  if (s.state == State::Loading) { // still searching: start right after it
+    s.pendingGenerate = true;
+    s.lastError.clear();
+    return true;
+  }
+  const bool redo = s.state == State::Ready && s.result &&
+                    startsWith(s.result->source, "generated");
+  if (s.state != State::NotFound && !redo)
+    return false;
+  startGenerationLocked(shared_, songPath);
   return true;
+}
+
+bool Manager::generatePending() const {
+  std::lock_guard<std::mutex> lock(shared_->m);
+  return shared_->pendingGenerate;
 }
 
 void Manager::cancelGenerate() {
   std::lock_guard<std::mutex> lock(shared_->m);
+  if (shared_->pendingGenerate) {
+    shared_->pendingGenerate = false;
+    return;
+  }
   if (!shared_->generating)
     return;
   cancelGenerationLocked(*shared_);

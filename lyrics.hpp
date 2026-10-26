@@ -79,7 +79,10 @@ public:
   // no lyrics were found (or to redo lyrics that were generated before).
   // Returns false if it could not start (see lastError()).
   bool generate(const std::string &songPath, double durationSeconds);
-  void cancelGenerate();
+  void cancelGenerate(); // also cancels a generation that is still waiting
+  // True when generate() was called while the lyrics search was still running:
+  // Whisper then starts right after that search, if it finds nothing.
+  bool generatePending() const;
   double generatingSeconds() const; // time since generation started, else 0
   std::string lastError() const;    // why the last generation / start failed
 
