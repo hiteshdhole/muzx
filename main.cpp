@@ -42,13 +42,41 @@ namespace {
 
 constexpr const char *kReset = "\033[0m";
 constexpr const char *kSelected = "\033[7m";
-constexpr const char *kMuted = "\033[90m";
-constexpr const char *kPurpleBold = "\033[1;35m";
-constexpr const char *kPink = "\033[95m";
-constexpr const char *kGreenBold = "\033[1;32m";
-constexpr const char *kCyanBold = "\033[1;36m";
+// Theme colours: changed at run time by applyTheme() (Settings tab).
+const char *kMuted = "\033[90m";
+const char *kPurpleBold = "\033[1;35m";
+const char *kPink = "\033[95m";
+const char *kGreenBold = "\033[1;32m";
+const char *kCyanBold = "\033[1;36m";
+const char *kLyricCurrent = "\033[1;95m"; // bold accent: the line being sung
+constexpr const char *kLyricNear = "\033[37m"; // light grey
 
-constexpr int kTabCount = 6;
+struct Theme {
+  const char *name, *title, *accent, *green, *cyan, *muted, *lyric;
+};
+const Theme kThemes[] = {{"Purple", "\033[1;35m", "\033[95m", "\033[1;32m",
+                          "\033[1;36m", "\033[90m", "\033[1;95m"},
+                         {"Ocean", "\033[1;34m", "\033[96m", "\033[1;36m",
+                          "\033[1;94m", "\033[90m", "\033[1;96m"},
+                         {"Forest", "\033[1;32m", "\033[93m", "\033[1;92m",
+                          "\033[1;33m", "\033[90m", "\033[1;93m"},
+                         {"Sunset", "\033[1;31m", "\033[93m", "\033[1;33m",
+                          "\033[1;91m", "\033[90m", "\033[1;93m"},
+                         {"Mono", "\033[1;37m", "\033[97m", "\033[1;37m",
+                          "\033[37m", "\033[90m", "\033[1;97m"}};
+constexpr int kThemeCount = 5;
+
+void applyTheme(int index) {
+  const Theme &t = kThemes[((index % kThemeCount) + kThemeCount) % kThemeCount];
+  kPurpleBold = t.title;
+  kPink = t.accent;
+  kGreenBold = t.green;
+  kCyanBold = t.cyan;
+  kMuted = t.muted;
+  kLyricCurrent = t.lyric;
+}
+
+constexpr int kTabCount = 7;
 constexpr int kFrameMs = 16;
 constexpr int kEscapeTimeoutMs = 25;
 // 1-based terminal column where the visualizer starts when album art is shown
@@ -81,7 +109,7 @@ volatile std::sig_atomic_t quitSignal = 0;
 void onSignal(int) { quitSignal = 1; }
 
 void installSignalHandlers() {
-  struct sigaction sa {};
+  struct sigaction sa{};
   sa.sa_handler = onSignal;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
@@ -338,7 +366,8 @@ void collectAudioFiles(Iterator it, std::error_code &ec,
   while (!ec && it != end) {
     std::error_code entryEc;
     if (it->is_regular_file(entryEc) && isAudioFile(it->path())) {
-      const fs::path absolute = fs::absolute(it->path(), entryEc).lexically_normal();
+      const fs::path absolute =
+          fs::absolute(it->path(), entryEc).lexically_normal();
       out.emplace_back(lowerCase(absolute.filename().string()),
                        absolute.string());
     }
@@ -352,10 +381,10 @@ std::vector<std::string> audioFilesIn(const fs::path &folder,
   std::error_code ec;
 
   if (recursive) {
-    collectAudioFiles(fs::recursive_directory_iterator(
-                          folder, fs::directory_options::skip_permission_denied,
-                          ec),
-                      ec, keyed);
+    collectAudioFiles(
+        fs::recursive_directory_iterator(
+            folder, fs::directory_options::skip_permission_denied, ec),
+        ec, keyed);
   } else {
     collectAudioFiles(fs::directory_iterator(folder, ec), ec, keyed);
   }
@@ -414,7 +443,8 @@ enum class AppTab {
   Queue = 2,
   Search = 3,
   Status = 4,
-  Keybindings = 5
+  Keybindings = 5,
+  Settings = 6
 };
 
 struct AppState {
@@ -440,13 +470,24 @@ struct AppState {
   bool showAlbumArt = false;
   bool showVisualizer = false;
   LyricsMode lyricsMode = LyricsMode::Right; // "L": Off -> Right -> Bottom
-  bool lyricsAutoGen = false;     // "A": generate lyrics when none exist
-  bool lyricsAutoTried = false;   // auto-generation already tried for this song
-  bool whisperAvailable = false;  // a whisper command was found
+  bool lyricsAutoGen =
+      true; // "A": generate lyrics when none exist (default ON)
+  bool lyricsAutoTried = false;  // auto-generation already tried for this song
+  bool whisperAvailable = false; // a whisper command was found
   std::chrono::steady_clock::time_point lyricsSongSince{};
   lyrics::Manager lyricsMgr; // finds lyrics on a background thread
-  LcdLink lcd;               // "T": show the current lyric line on the Arduino LCD
-  std::string lyricsSong;    // song the lyrics were last requested for
+  LcdLink lcd; // "T": show the current lyric line on the Arduino LCD
+  // Settings tab
+  selection settingsCursor;
+  int theme = 0;
+  int fontSize = 0;         // 0 = leave the terminal's font alone
+  std::string whisperModel; // "" = default / environment
+  std::string whisperLang;  // "" = automatic
+  fs::path settingsFile;
+  std::string settingsSaved; // what is on disk now
+  std::string settingsNote;  // message shown at the bottom of the tab
+  config *cfg = nullptr;
+  std::string lyricsSong; // song the lyrics were last requested for
 
   double sessionPlayedSeconds = 0.0;
   double totalPlayedSeconds = 0.0;
@@ -800,8 +841,8 @@ std::size_t visualLength(const std::string &text) {
 
 void showTabs(AppTab active) {
   std::cout << kPurpleBold << "MUZX  " << kReset;
-  const char *names[] = {"1 Player", "2 Folders", "3 Queue",
-                         "4 Search", "5 Status",  "6 Keys"};
+  const char *names[] = {"1 Player", "2 Folders", "3 Queue",   "4 Search",
+                         "5 Status", "6 Keys",    "7 Settings"};
 
   for (int i = 0; i < kTabCount; ++i) {
     AppTab tab = static_cast<AppTab>(i);
@@ -1145,8 +1186,9 @@ void drawKeybindings() {
 
   std::cout << "\n";
   section("NAVIGATION & TABS");
-  row("Tab / Shift+Tab", "Cycle tabs (or keys 1-6)");
+  row("Tab / Shift+Tab", "Cycle tabs (or keys 1-7)");
   row("5", "Open Status (Clock, Played Time, Top Songs)");
+  row("7", "Settings (j/k move, Enter or ←/→ change)");
   row("j / k  or  ↑ / ↓", "Navigate lists");
   row("l / Enter", "Open folder / play selected song");
   row("Backspace / h", "Parent folder");
@@ -1162,6 +1204,303 @@ void drawKeybindings() {
 }
 
 // ---------------------------------------------------------------------------
+// Settings tab
+// ---------------------------------------------------------------------------
+
+enum SettingItem {
+  SetLyrics = 0,
+  SetAutoGen,
+  SetModel,
+  SetLang, // lyrics
+  SetLcd,
+  SetLcdKana, // LCD
+  SetArt,
+  SetVisualizer,
+  SetTheme,
+  SetFont,   // display
+  SetFolder, // general
+  kSettingCount
+};
+
+const char *const kModelChoices[] = {"",      "tiny",   "base",
+                                     "small", "medium", "large-v3"};
+const char *const kLangChoices[] = {"",   "en", "hi", "ja", "ko", "zh",
+                                    "es", "fr", "de", "ru", "pt", "it",
+                                    "ar", "ur", "pa", "ta", "te", "bn"};
+const int kFontChoices[] = {0, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28};
+
+int cycleIndex(int current, int dir, int count) {
+  return ((current + dir) % count + count) % count;
+}
+
+template <std::size_t N>
+int indexOfString(const char *const (&list)[N], const std::string &value) {
+  for (std::size_t i = 0; i < N; ++i)
+    if (value == list[i])
+      return static_cast<int>(i);
+  return 0;
+}
+
+// Whisper reads its model and language from the environment each time it runs.
+void applyWhisperEnv(const AppState &app, bool clearWhenEmpty) {
+  if (!app.whisperModel.empty())
+    setenv("MUZX_WHISPER_MODEL", app.whisperModel.c_str(), 1);
+  else if (clearWhenEmpty)
+    unsetenv("MUZX_WHISPER_MODEL");
+  if (!app.whisperLang.empty())
+    setenv("MUZX_WHISPER_LANG", app.whisperLang.c_str(), 1);
+  else if (clearWhenEmpty)
+    unsetenv("MUZX_WHISPER_LANG");
+}
+
+// Font size can only be changed by Kitty itself, through its remote control.
+// Returns an empty string on success, otherwise a message for the user.
+std::string applyFontSize(int size) {
+  if (!std::getenv("KITTY_WINDOW_ID"))
+    return "Font size only works inside the Kitty terminal.";
+  const std::string command = "timeout 2 kitty @ set-font-size " +
+                              std::to_string(size) + " >/dev/null 2>&1";
+  if (std::system(command.c_str()) != 0)
+    return "Font size failed: add 'allow_remote_control yes' to kitty.conf, "
+           "restart Kitty.";
+  return "";
+}
+
+std::string settingsToText(const AppState &app) {
+  std::ostringstream out;
+  out << "lyrics_mode=" << static_cast<int>(app.lyricsMode) << "\n"
+      << "auto_generate=" << (app.lyricsAutoGen ? 1 : 0) << "\n"
+      << "whisper_model=" << app.whisperModel << "\n"
+      << "whisper_lang=" << app.whisperLang << "\n"
+      << "lcd=" << (app.lcd.enabled() ? 1 : 0) << "\n"
+      << "lcd_kana=" << (app.lcd.kana() ? 1 : 0) << "\n"
+      << "album_art=" << (app.showAlbumArt ? 1 : 0) << "\n"
+      << "visualizer=" << (app.showVisualizer ? 1 : 0) << "\n"
+      << "theme=" << kThemes[app.theme].name << "\n"
+      << "font_size=" << app.fontSize << "\n";
+  return out.str();
+}
+
+// Writes the settings file, but only when something changed.
+void saveSettings(AppState &app) {
+  if (app.settingsFile.empty())
+    return;
+  const std::string text = settingsToText(app);
+  if (text == app.settingsSaved)
+    return;
+  std::ofstream file(app.settingsFile, std::ios::trunc);
+  if (file << text) {
+    file.close();
+    app.settingsSaved = text;
+  }
+}
+
+void loadSettings(AppState &app) {
+  std::ifstream file(app.settingsFile);
+  std::map<std::string, std::string> values;
+  std::string line, onDisk;
+  while (std::getline(file, line)) {
+    onDisk += line + "\n";
+    const std::size_t eq = line.find('=');
+    if (eq != std::string::npos)
+      values[line.substr(0, eq)] = line.substr(eq + 1);
+  }
+  auto flag = [&](const char *key, bool &out) {
+    auto it = values.find(key);
+    if (it != values.end())
+      out = it->second == "1";
+  };
+  if (values.count("lyrics_mode")) {
+    const int mode = std::atoi(values["lyrics_mode"].c_str());
+    if (mode >= 0 && mode <= 2)
+      app.lyricsMode = static_cast<LyricsMode>(mode);
+  }
+  flag("auto_generate", app.lyricsAutoGen);
+  flag("album_art", app.showAlbumArt);
+  flag("visualizer", app.showVisualizer);
+  if (values.count("lcd"))
+    app.lcd.setEnabled(values["lcd"] == "1");
+  if (values.count("lcd_kana"))
+    app.lcd.setKana(values["lcd_kana"] == "1");
+  if (values.count("whisper_model"))
+    app.whisperModel = values["whisper_model"];
+  if (values.count("whisper_lang"))
+    app.whisperLang = values["whisper_lang"];
+  if (values.count("theme"))
+    for (int i = 0; i < kThemeCount; ++i)
+      if (values["theme"] == kThemes[i].name)
+        app.theme = i;
+  if (values.count("font_size"))
+    app.fontSize =
+        std::max(0, std::min(72, std::atoi(values["font_size"].c_str())));
+  app.settingsSaved =
+      onDisk; // what is on disk now; saveSettings() rewrites only on change
+}
+
+// Changes one setting by one step forward (+1) or backward (-1).
+void changeSetting(AppState &app, int item, int dir) {
+  app.settingsNote.clear();
+  switch (item) {
+  case SetLyrics:
+    app.lyricsMode = static_cast<LyricsMode>(
+        cycleIndex(static_cast<int>(app.lyricsMode), dir, 3));
+    break;
+  case SetAutoGen:
+    app.lyricsAutoGen = !app.lyricsAutoGen;
+    app.lyricsAutoTried = false;
+    app.whisperAvailable = !lyrics::generatorCommand().empty();
+    break;
+  case SetModel: {
+    const int n =
+        static_cast<int>(sizeof(kModelChoices) / sizeof(kModelChoices[0]));
+    app.whisperModel = kModelChoices[cycleIndex(
+        indexOfString(kModelChoices, app.whisperModel), dir, n)];
+    applyWhisperEnv(app, true);
+    break;
+  }
+  case SetLang: {
+    const int n =
+        static_cast<int>(sizeof(kLangChoices) / sizeof(kLangChoices[0]));
+    app.whisperLang = kLangChoices[cycleIndex(
+        indexOfString(kLangChoices, app.whisperLang), dir, n)];
+    applyWhisperEnv(app, true);
+    break;
+  }
+  case SetLcd:
+    app.lcd.toggle();
+    break;
+  case SetLcdKana:
+    app.lcd.setKana(!app.lcd.kana());
+    break;
+  case SetArt:
+    app.showAlbumArt = !app.showAlbumArt;
+    break;
+  case SetVisualizer:
+    app.showVisualizer = !app.showVisualizer;
+    break;
+  case SetTheme:
+    app.theme = cycleIndex(app.theme, dir, kThemeCount);
+    applyTheme(app.theme);
+    break;
+  case SetFont: {
+    const int n =
+        static_cast<int>(sizeof(kFontChoices) / sizeof(kFontChoices[0]));
+    int at = 0;
+    for (int i = 0; i < n; ++i)
+      if (kFontChoices[i] == app.fontSize)
+        at = i;
+    app.fontSize = kFontChoices[cycleIndex(at, dir, n)];
+    clearTerminalCover();
+    app.settingsNote = applyFontSize(app.fontSize);
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+// Asks for a new music folder (same style as the search prompt).
+void askMusicFolder(AppState &app) {
+  clearTerminalCover();
+  disableRawMode();
+  std::cout << "\033[?7h\033[?25h\033[2J\033[H";
+  std::cout << kPurpleBold << "New music folder (empty = cancel): " << kReset
+            << std::flush;
+  std::string input;
+  if (!std::getline(std::cin, input)) {
+    std::cin.clear();
+    input.clear();
+  }
+  input = trim(input);
+  if (input.empty()) {
+    app.settingsNote = "Music folder not changed.";
+  } else {
+    std::error_code ec;
+    const fs::path folder = normalizeFolder(input);
+    if (!folder.empty() && fs::is_directory(folder, ec)) {
+      app.musicRoot = folder;
+      openFolder(app, folder);
+      if (app.cfg)
+        app.cfg->save_music_folder(folder.string());
+      app.settingsNote = "Music folder set to " + folder.string();
+    } else {
+      app.settingsNote = "Not a folder: " + input;
+    }
+  }
+  std::cout << "\033[?7l\033[?25l" << std::flush;
+  enableRawMode();
+}
+
+std::string settingValue(const AppState &app, int item) {
+  auto onOff = [](bool v) { return std::string(v ? "On" : "Off"); };
+  switch (item) {
+  case SetLyrics:
+    return app.lyricsMode == LyricsMode::Off     ? "Off"
+           : app.lyricsMode == LyricsMode::Right ? "Right of the player"
+                                                 : "Below the player";
+  case SetAutoGen:
+    return onOff(app.lyricsAutoGen) +
+           (app.whisperAvailable ? "" : "   (Whisper not installed)");
+  case SetModel:
+    return app.whisperModel.empty() ? "default" : app.whisperModel;
+  case SetLang:
+    return app.whisperLang.empty() ? "automatic" : app.whisperLang;
+  case SetLcd:
+    return app.lcd.enabled()
+               ? (app.lcd.connected() ? "On (connected)"
+                                      : "On (waiting for the Arduino)")
+               : "Off";
+  case SetLcdKana:
+    return app.lcd.kana() ? "Katakana (Japanese ROM)" : "Romaji (any LCD)";
+  case SetArt:
+    return onOff(app.showAlbumArt);
+  case SetVisualizer:
+    return onOff(app.showVisualizer);
+  case SetTheme:
+    return kThemes[app.theme].name;
+  case SetFont:
+    return app.fontSize == 0 ? "terminal default"
+                             : std::to_string(app.fontSize);
+  case SetFolder:
+    return app.musicRoot.string();
+  default:
+    return "";
+  }
+}
+
+void drawSettings(const AppState &app) {
+  static const char *const labels[kSettingCount] = {
+      "Lyrics panel", "Auto-generate", "Whisper model", "Whisper language",
+      "LCD display",  "LCD Japanese",  "Album art",     "Visualizer",
+      "Theme",        "Font size",     "Music folder"};
+  std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
+  const std::size_t selected = app.settingsCursor.current();
+  for (int i = 0; i < kSettingCount; ++i) {
+    if (i == SetLyrics)
+      std::cout << "\n  " << kMuted << "LYRICS" << kReset << "\n";
+    else if (i == SetLcd)
+      std::cout << "\n  " << kMuted << "LCD (Arduino)" << kReset << "\n";
+    else if (i == SetArt)
+      std::cout << "\n  " << kMuted << "DISPLAY" << kReset << "\n";
+    else if (i == SetFolder)
+      std::cout << "\n  " << kMuted << "GENERAL" << kReset << "\n";
+    std::string label = labels[i];
+    label.resize(20, ' ');
+    if (static_cast<std::size_t>(i) == selected)
+      std::cout << "  " << kSelected << " " << label << settingValue(app, i)
+                << " " << kReset << "\n";
+    else
+      std::cout << "    " << label << kPink << settingValue(app, i) << kReset
+                << "\n";
+  }
+  std::cout << "\n  " << kMuted
+            << "j/k move   Enter or →/l next value   ←/h previous value"
+            << kReset << "\n";
+  if (!app.settingsNote.empty())
+    std::cout << "  " << kGreenBold << app.settingsNote << kReset << "\n";
+}
+
+// ---------------------------------------------------------------------------
 // Lyrics panel (right side of the Player tab)
 //
 // lyrics.cpp finds the lyrics on a background thread. Here we only DRAW them:
@@ -1172,8 +1511,6 @@ void drawKeybindings() {
 
 constexpr int kLyricsMinCols = 101;         // narrower terminals: no panel
 constexpr double kLyricsLeadSeconds = 0.25; // highlight a line a bit early
-constexpr const char *kLyricCurrent = "\033[1;95m"; // bold pink
-constexpr const char *kLyricNear = "\033[37m";      // light grey
 
 int terminalCols() {
   winsize w{};
@@ -1238,7 +1575,8 @@ std::vector<std::string> wrapLyric(const std::string &text, std::size_t width) {
 
   std::string cur;
   std::size_t curW = 0;
-  std::size_t lastSpaceByte = std::string::npos; // position of last space in cur
+  std::size_t lastSpaceByte =
+      std::string::npos; // position of last space in cur
   std::size_t widthBeforeSpace = 0;
 
   for (std::size_t i = 0; i < text.size();) {
@@ -1372,10 +1710,10 @@ void updateLcd(AppState &app) {
 
 // Where the lyrics are drawn.
 struct LyricsBox {
-  int col = 1;       // left column (1-based)
-  int titleRow = 1;  // row of the "LYRICS" title
-  int top = 1;       // first lyric row
-  int height = 0;    // number of lyric rows
+  int col = 1;      // left column (1-based)
+  int titleRow = 1; // row of the "LYRICS" title
+  int top = 1;      // first lyric row
+  int height = 0;   // number of lyric rows
   std::size_t width = 0;
   bool centered = false; // bottom placement centres every line
 };
@@ -1450,9 +1788,9 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
   if (result)
     detail = "  " + result->source + (result->synced ? "" : "  (not synced)");
   const std::string autoState = app.lyricsAutoGen ? "ON" : "OFF";
-  const std::string hints[] = {
-      "   L move/hide  |  G generate  |  A auto (" + autoState + ")",
-      "   [L] [G] [A]", ""};
+  const std::string hints[] = {"   L move/hide  |  G generate  |  A auto (" +
+                                   autoState + ")",
+                               "   [L] [G] [A]", ""};
   const std::size_t titleRoom = width > 6 ? width - 6 : 0;
   for (const std::string &hint : hints) {
     if (displayWidth(detail + hint) <= titleRoom) {
@@ -1612,12 +1950,16 @@ void drawScreen(const AppState &app) {
     case AppTab::Keybindings:
       drawKeybindings();
       break;
+    case AppTab::Settings:
+      drawSettings(app);
+      break;
     }
 
     std::cout
         << kMuted
         << "------------------------------------------------------------\n"
-        << "  Tab/1-6 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  L Lyrics  |  "
+        << "  Tab/1-7 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  L "
+           "Lyrics  |  "
            "q/Esc Quit"
         << kReset;
     std::cout.flush();
@@ -1685,7 +2027,7 @@ enum class KeyResult { Handled, FlushInput, Quit };
 KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   std::error_code ec;
 
-  if (key >= '1' && key <= '6') {
+  if (key >= '1' && key <= '7') {
     app.tab = static_cast<AppTab>(key - '1');
     return KeyResult::Handled;
   }
@@ -1694,9 +2036,32 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
     return KeyResult::Handled;
   }
   if (key == KeyShiftTab) {
-    app.tab = static_cast<AppTab>(
-        (static_cast<int>(app.tab) + kTabCount - 1) % kTabCount);
+    app.tab = static_cast<AppTab>((static_cast<int>(app.tab) + kTabCount - 1) %
+                                  kTabCount);
     return KeyResult::Handled;
+  }
+
+  if (app.tab == AppTab::Settings) {
+    if (key == 'j' || key == KeyDown) {
+      app.settingsCursor.moveDown(kSettingCount);
+      return KeyResult::Handled;
+    }
+    if (key == 'k' || key == KeyUp) {
+      app.settingsCursor.moveUp(kSettingCount);
+      return KeyResult::Handled;
+    }
+    const bool forward = key == KeyEnter || key == KeyRight || key == 'l';
+    if (forward || key == KeyLeft || key == 'h') {
+      const int item = static_cast<int>(app.settingsCursor.current());
+      if (item == SetFolder) {
+        if (forward)
+          askMusicFolder(app);
+        return KeyResult::FlushInput;
+      }
+      changeSetting(app, item, forward ? 1 : -1);
+      saveSettings(app);
+      return KeyResult::Handled;
+    }
   }
 
   if (key == 'q' || key == KeyEscape)
@@ -1724,11 +2089,11 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   }
   if (key == 'L') {
     // Off -> Right panel -> Below the player -> Off
-    app.lyricsMode = app.lyricsMode == LyricsMode::Off
-                         ? LyricsMode::Right
-                         : (app.lyricsMode == LyricsMode::Right
-                                ? LyricsMode::Bottom
-                                : LyricsMode::Off);
+    app.lyricsMode =
+        app.lyricsMode == LyricsMode::Off
+            ? LyricsMode::Right
+            : (app.lyricsMode == LyricsMode::Right ? LyricsMode::Bottom
+                                                   : LyricsMode::Off);
     return KeyResult::Handled;
   }
   if (key == 'G' || key == 'g') {
@@ -1918,6 +2283,7 @@ int run() {
   }
 
   AppState app;
+  app.cfg = &settings;
   app.musicRoot = root;
   app.browseFolder = root;
   app.folderEntries = directoryEntries(root);
@@ -1944,6 +2310,13 @@ int run() {
       online && std::string(online) == "0")
     app.lyricsMgr.setOnlineEnabled(false);
 
+  app.settingsFile = configDirectory / "settings.conf";
+  loadSettings(app);
+  applyTheme(app.theme);
+  applyWhisperEnv(app, false);
+  if (app.fontSize > 0)
+    applyFontSize(app.fontSize); // before the screen switches to raw mode
+
   installSignalHandlers();
   TerminalSession terminal;
   bool running = true;
@@ -1966,6 +2339,8 @@ int run() {
     if (statsSaveAccumulator >= 5.0) {
       if (app.statsDirty)
         saveStats(app);
+      saveSettings(
+          app); // picks up changes made with the hot keys (L, A, T, i, v)
       statsSaveAccumulator = 0.0;
     }
 
@@ -1991,6 +2366,7 @@ int run() {
   app.player.stop();
   app.songQueue.save(queueFile.string());
   saveStats(app);
+  saveSettings(app);
   return 0;
 }
 

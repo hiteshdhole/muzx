@@ -18,11 +18,11 @@ namespace lcdtext {
 
 inline std::size_t decode(const std::string &s, std::size_t i, unsigned &cp) {
   const unsigned char c = static_cast<unsigned char>(s[i]);
-  std::size_t n = c < 0x80           ? 1
-                  : (c >> 5) == 6    ? 2
-                  : (c >> 4) == 14   ? 3
-                  : (c >> 3) == 30   ? 4
-                                     : 1;
+  std::size_t n = c < 0x80         ? 1
+                  : (c >> 5) == 6  ? 2
+                  : (c >> 4) == 14 ? 3
+                  : (c >> 3) == 30 ? 4
+                                   : 1;
   if (i + n > s.size())
     n = 1;
   if (n == 1) {
@@ -86,132 +86,289 @@ inline std::string kakasiRomaji(const std::string &in) {
 // plus Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam (U+0A80..0D7F)
 // ===========================================================================
 
-inline bool isIndicCp(unsigned cp) {
-  return cp >= 0x0900 && cp <= 0x0D7F;
-}
+inline bool isIndicCp(unsigned cp) { return cp >= 0x0900 && cp <= 0x0D7F; }
 
 inline bool isIndicConsonantOffset(unsigned off, unsigned block,
                                    const char *&rom) {
   switch (off) {
-  case 0x15: rom = "k"; return true;
-  case 0x16: rom = "kh"; return true;
-  case 0x17: rom = "g"; return true;
-  case 0x18: rom = "gh"; return true;
-  case 0x19: rom = "ng"; return true;
-  case 0x1A: rom = "ch"; return true;
-  case 0x1B: rom = "chh"; return true;
-  case 0x1C: rom = "j"; return true;
-  case 0x1D: rom = "jh"; return true;
-  case 0x1E: rom = "ny"; return true;
-  case 0x1F: rom = "t"; return true;
-  case 0x20: rom = "th"; return true;
-  case 0x21: rom = "d"; return true;
-  case 0x22: rom = "dh"; return true;
-  case 0x23: rom = "n"; return true;
-  case 0x24: rom = "t"; return true;
-  case 0x25: rom = "th"; return true;
-  case 0x26: rom = "d"; return true;
-  case 0x27: rom = "dh"; return true;
-  case 0x28: rom = "n"; return true;
-  case 0x29: rom = "n"; return true;
-  case 0x2A: rom = "p"; return true;
-  case 0x2B: rom = "ph"; return true;
-  case 0x2C: rom = "b"; return true;
-  case 0x2D: rom = "bh"; return true;
-  case 0x2E: rom = "m"; return true;
-  case 0x2F: rom = "y"; return true;
-  case 0x30: rom = "r"; return true;
-  case 0x31: rom = "r"; return true;
-  case 0x32: rom = "l"; return true;
-  case 0x33: rom = "l"; return true; // Marathi ळ / Punjabi ਲ਼
-  case 0x34: rom = "l"; return true;
-  case 0x35: rom = (block == 0x0980) ? "b" : "v"; return true;
-  case 0x36: rom = "sh"; return true;
-  case 0x37: rom = "sh"; return true;
-  case 0x38: rom = "s"; return true;
-  case 0x39: rom = "h"; return true;
+  case 0x15:
+    rom = "k";
+    return true;
+  case 0x16:
+    rom = "kh";
+    return true;
+  case 0x17:
+    rom = "g";
+    return true;
+  case 0x18:
+    rom = "gh";
+    return true;
+  case 0x19:
+    rom = "ng";
+    return true;
+  case 0x1A:
+    rom = "ch";
+    return true;
+  case 0x1B:
+    rom = "chh";
+    return true;
+  case 0x1C:
+    rom = "j";
+    return true;
+  case 0x1D:
+    rom = "jh";
+    return true;
+  case 0x1E:
+    rom = "ny";
+    return true;
+  case 0x1F:
+    rom = "t";
+    return true;
+  case 0x20:
+    rom = "th";
+    return true;
+  case 0x21:
+    rom = "d";
+    return true;
+  case 0x22:
+    rom = "dh";
+    return true;
+  case 0x23:
+    rom = "n";
+    return true;
+  case 0x24:
+    rom = "t";
+    return true;
+  case 0x25:
+    rom = "th";
+    return true;
+  case 0x26:
+    rom = "d";
+    return true;
+  case 0x27:
+    rom = "dh";
+    return true;
+  case 0x28:
+    rom = "n";
+    return true;
+  case 0x29:
+    rom = "n";
+    return true;
+  case 0x2A:
+    rom = "p";
+    return true;
+  case 0x2B:
+    rom = "ph";
+    return true;
+  case 0x2C:
+    rom = "b";
+    return true;
+  case 0x2D:
+    rom = "bh";
+    return true;
+  case 0x2E:
+    rom = "m";
+    return true;
+  case 0x2F:
+    rom = "y";
+    return true;
+  case 0x30:
+    rom = "r";
+    return true;
+  case 0x31:
+    rom = "r";
+    return true;
+  case 0x32:
+    rom = "l";
+    return true;
+  case 0x33:
+    rom = "l";
+    return true; // Marathi ळ / Punjabi ਲ਼
+  case 0x34:
+    rom = "l";
+    return true;
+  case 0x35:
+    rom = (block == 0x0980) ? "b" : "v";
+    return true;
+  case 0x36:
+    rom = "sh";
+    return true;
+  case 0x37:
+    rom = "sh";
+    return true;
+  case 0x38:
+    rom = "s";
+    return true;
+  case 0x39:
+    rom = "h";
+    return true;
   // Precomposed Nukta / Regional extensions
-  case 0x58: rom = "q"; return true;
-  case 0x59: rom = "kh"; return true;
-  case 0x5A: rom = "gh"; return true;
-  case 0x5B: rom = "z"; return true;
-  case 0x5C: rom = "r"; return true; // ड़ / ড় / ੜ
-  case 0x5D: rom = "rh"; return true;
-  case 0x5E: rom = "f"; return true;
-  case 0x5F: rom = "y"; return true; // Bengali য়
+  case 0x58:
+    rom = "q";
+    return true;
+  case 0x59:
+    rom = "kh";
+    return true;
+  case 0x5A:
+    rom = "gh";
+    return true;
+  case 0x5B:
+    rom = "z";
+    return true;
+  case 0x5C:
+    rom = "r";
+    return true; // ड़ / ড় / ੜ
+  case 0x5D:
+    rom = "rh";
+    return true;
+  case 0x5E:
+    rom = "f";
+    return true;
+  case 0x5F:
+    rom = "y";
+    return true; // Bengali য়
   case 0x70:
-    if (block == 0x0980) { rom = "r"; return true; } // Assamese র
+    if (block == 0x0980) {
+      rom = "r";
+      return true;
+    } // Assamese র
     return false;
   case 0x71:
-    if (block == 0x0980) { rom = "v"; return true; } // Assamese ৱ
+    if (block == 0x0980) {
+      rom = "v";
+      return true;
+    } // Assamese ৱ
     return false;
-  case 0x79: rom = "z"; return true;
-  case 0x7A: rom = "y"; return true;
-  default: return false;
+  case 0x79:
+    rom = "z";
+    return true;
+  case 0x7A:
+    rom = "y";
+    return true;
+  default:
+    return false;
   }
 }
 
 inline const char *indicNuktaOverride(unsigned off, unsigned block) {
   switch (off) {
-  case 0x15: return "q";
-  case 0x16: return "kh";
-  case 0x17: return "gh";
-  case 0x1C: return "z";
-  case 0x21: return "r";
-  case 0x22: return "rh";
-  case 0x2B: return "f";
-  case 0x2F: return (block == 0x0980) ? "y" : nullptr;
-  case 0x38: return (block == 0x0A00) ? "sh" : nullptr; // Punjabi ਸ਼ (sha)
-  default: return nullptr;
+  case 0x15:
+    return "q";
+  case 0x16:
+    return "kh";
+  case 0x17:
+    return "gh";
+  case 0x1C:
+    return "z";
+  case 0x21:
+    return "r";
+  case 0x22:
+    return "rh";
+  case 0x2B:
+    return "f";
+  case 0x2F:
+    return (block == 0x0980) ? "y" : nullptr;
+  case 0x38:
+    return (block == 0x0A00) ? "sh" : nullptr; // Punjabi ਸ਼ (sha)
+  default:
+    return nullptr;
   }
 }
 
 inline bool isIndicMatraOffset(unsigned off, const char *&matra) {
   switch (off) {
-  case 0x3E: matra = "a"; return true;  // ा / া / ਾ
-  case 0x3F: matra = "i"; return true;  // ि / ি / ਿ
-  case 0x40: matra = "ee"; return true; // ी / ী / ੀ
-  case 0x41: matra = "u"; return true;  // ु / ু / ੁ
-  case 0x42: matra = "oo"; return true; // ू / ূ / ੂ
+  case 0x3E:
+    matra = "a";
+    return true; // ा / া / ਾ
+  case 0x3F:
+    matra = "i";
+    return true; // ि / ি / ਿ
+  case 0x40:
+    matra = "ee";
+    return true; // ी / ী / ੀ
+  case 0x41:
+    matra = "u";
+    return true; // ु / ু / ੁ
+  case 0x42:
+    matra = "oo";
+    return true; // ू / ূ / ੂ
   case 0x43:
-  case 0x44: matra = "ri"; return true; // ृ / ৃ
+  case 0x44:
+    matra = "ri";
+    return true; // ृ / ৃ
   case 0x45:
   case 0x46:
-  case 0x47: matra = "e"; return true;  // े / ে / ੇ / ॲ
-  case 0x48: matra = "ai"; return true; // ै / ৈ / ੈ
+  case 0x47:
+    matra = "e";
+    return true; // े / ে / ੇ / ॲ
+  case 0x48:
+    matra = "ai";
+    return true; // ै / ৈ / ੈ
   case 0x49:
   case 0x4A:
-  case 0x4B: matra = "o"; return true;  // ो / ো / ੋ / ऑ
+  case 0x4B:
+    matra = "o";
+    return true; // ो / ো / ੋ / ऑ
   case 0x4C:
-  case 0x57: matra = "au"; return true; // ौ / ৌ / ੌ
-  default: return false;
+  case 0x57:
+    matra = "au";
+    return true; // ौ / ৌ / ੌ
+  default:
+    return false;
   }
 }
 
 inline bool isIndicVowelOffset(unsigned off, const char *&v) {
   switch (off) {
   case 0x04:
-  case 0x05: v = "a"; return true;  // अ / অ / ਅ
-  case 0x06: v = "aa"; return true; // आ / আ / ਆ
-  case 0x07: v = "i"; return true;  // इ / ই / ਇ
-  case 0x08: v = "ee"; return true; // ई / ঈ / ਈ
-  case 0x09: v = "u"; return true;  // उ / উ / ਉ
-  case 0x0A: v = "oo"; return true; // ऊ / ঊ / ਊ
+  case 0x05:
+    v = "a";
+    return true; // अ / অ / ਅ
+  case 0x06:
+    v = "aa";
+    return true; // आ / আ / ਆ
+  case 0x07:
+    v = "i";
+    return true; // इ / ই / ਇ
+  case 0x08:
+    v = "ee";
+    return true; // ई / ঈ / ਈ
+  case 0x09:
+    v = "u";
+    return true; // उ / উ / ਉ
+  case 0x0A:
+    v = "oo";
+    return true; // ऊ / ঊ / ਊ
   case 0x0B:
   case 0x0C:
   case 0x60:
-  case 0x61: v = "ri"; return true; // ऋ / ঋ
+  case 0x61:
+    v = "ri";
+    return true; // ऋ / ঋ
   case 0x0D:
   case 0x0E:
-  case 0x0F: v = "e"; return true;  // ए / এ / ਏ / ॲ
-  case 0x10: v = "ai"; return true; // ऐ / ঐ / ਐ
+  case 0x0F:
+    v = "e";
+    return true; // ए / এ / ਏ / ॲ
+  case 0x10:
+    v = "ai";
+    return true; // ऐ / ঐ / ਐ
   case 0x11:
   case 0x12:
-  case 0x13: v = "o"; return true;  // ओ / ও / ਓ / ऑ
-  case 0x14: v = "au"; return true; // औ / ঔ / ਔ
-  case 0x72: v = "i"; return true;  // Gurmukhi Iri (ੲ)
-  case 0x73: v = "u"; return true;  // Gurmukhi Ura (ੳ)
-  default: return false;
+  case 0x13:
+    v = "o";
+    return true; // ओ / ও / ਓ / ऑ
+  case 0x14:
+    v = "au";
+    return true; // औ / ঔ / ਔ
+  case 0x72:
+    v = "i";
+    return true; // Gurmukhi Iri (ੲ)
+  case 0x73:
+    v = "u";
+    return true; // Gurmukhi Ura (ੳ)
+  default:
+    return false;
   }
 }
 
@@ -228,80 +385,178 @@ inline bool isIndicWordChar(unsigned cp) {
 
 inline bool isUrduChar(unsigned cp, const char *&rom) {
   switch (cp) {
-  case 0x0622: rom = "aa"; return true;
+  case 0x0622:
+    rom = "aa";
+    return true;
   case 0x0623:
   case 0x0625:
-  case 0x0627: rom = "a"; return true;
-  case 0x0628: rom = "b"; return true;
-  case 0x067E: rom = "p"; return true;
-  case 0x062A: rom = "t"; return true;
-  case 0x0679: rom = "t"; return true;
-  case 0x062B: rom = "s"; return true;
-  case 0x062C: rom = "j"; return true;
-  case 0x0686: rom = "ch"; return true;
-  case 0x062D: rom = "h"; return true;
-  case 0x062E: rom = "kh"; return true;
-  case 0x062F: rom = "d"; return true;
-  case 0x0688: rom = "d"; return true;
-  case 0x0630: rom = "z"; return true;
-  case 0x0631: rom = "r"; return true;
-  case 0x0691: rom = "r"; return true;
-  case 0x0632: rom = "z"; return true;
-  case 0x0698: rom = "zh"; return true;
-  case 0x0633: rom = "s"; return true;
-  case 0x0634: rom = "sh"; return true;
-  case 0x0635: rom = "s"; return true;
-  case 0x0636: rom = "z"; return true;
-  case 0x0637: rom = "t"; return true;
-  case 0x0638: rom = "z"; return true;
-  case 0x0639: rom = "a"; return true;
-  case 0x063A: rom = "gh"; return true;
-  case 0x0641: rom = "f"; return true;
-  case 0x0642: rom = "q"; return true;
+  case 0x0627:
+    rom = "a";
+    return true;
+  case 0x0628:
+    rom = "b";
+    return true;
+  case 0x067E:
+    rom = "p";
+    return true;
+  case 0x062A:
+    rom = "t";
+    return true;
+  case 0x0679:
+    rom = "t";
+    return true;
+  case 0x062B:
+    rom = "s";
+    return true;
+  case 0x062C:
+    rom = "j";
+    return true;
+  case 0x0686:
+    rom = "ch";
+    return true;
+  case 0x062D:
+    rom = "h";
+    return true;
+  case 0x062E:
+    rom = "kh";
+    return true;
+  case 0x062F:
+    rom = "d";
+    return true;
+  case 0x0688:
+    rom = "d";
+    return true;
+  case 0x0630:
+    rom = "z";
+    return true;
+  case 0x0631:
+    rom = "r";
+    return true;
+  case 0x0691:
+    rom = "r";
+    return true;
+  case 0x0632:
+    rom = "z";
+    return true;
+  case 0x0698:
+    rom = "zh";
+    return true;
+  case 0x0633:
+    rom = "s";
+    return true;
+  case 0x0634:
+    rom = "sh";
+    return true;
+  case 0x0635:
+    rom = "s";
+    return true;
+  case 0x0636:
+    rom = "z";
+    return true;
+  case 0x0637:
+    rom = "t";
+    return true;
+  case 0x0638:
+    rom = "z";
+    return true;
+  case 0x0639:
+    rom = "a";
+    return true;
+  case 0x063A:
+    rom = "gh";
+    return true;
+  case 0x0641:
+    rom = "f";
+    return true;
+  case 0x0642:
+    rom = "q";
+    return true;
   case 0x0643:
-  case 0x06A9: rom = "k"; return true;
-  case 0x06AF: rom = "g"; return true;
-  case 0x0644: rom = "l"; return true;
-  case 0x0645: rom = "m"; return true;
-  case 0x0646: rom = "n"; return true;
-  case 0x06BA: rom = "n"; return true;
-  case 0x06BB: rom = "rn"; return true; // Shahmukhi ݨ
+  case 0x06A9:
+    rom = "k";
+    return true;
+  case 0x06AF:
+    rom = "g";
+    return true;
+  case 0x0644:
+    rom = "l";
+    return true;
+  case 0x0645:
+    rom = "m";
+    return true;
+  case 0x0646:
+    rom = "n";
+    return true;
+  case 0x06BA:
+    rom = "n";
+    return true;
+  case 0x06BB:
+    rom = "rn";
+    return true; // Shahmukhi ݨ
   case 0x0648:
-  case 0x0624: rom = "o"; return true;
+  case 0x0624:
+    rom = "o";
+    return true;
   case 0x0647:
   case 0x06C1:
   case 0x06C2:
   case 0x06C3:
-  case 0x0629: rom = "h"; return true;
-  case 0x06BE: rom = "h"; return true;
+  case 0x0629:
+    rom = "h";
+    return true;
+  case 0x06BE:
+    rom = "h";
+    return true;
   case 0x0621:
   case 0x0626:
-  case 0x06D2: rom = "e"; return true;
+  case 0x06D2:
+    rom = "e";
+    return true;
   case 0x0649:
   case 0x064A:
-  case 0x06CC: rom = "i"; return true;
-  case 0x064E: rom = "a"; return true;
-  case 0x0650: rom = "i"; return true;
-  case 0x064F: rom = "u"; return true;
-  case 0x0670: rom = "a"; return true;
+  case 0x06CC:
+    rom = "i";
+    return true;
+  case 0x064E:
+    rom = "a";
+    return true;
+  case 0x0650:
+    rom = "i";
+    return true;
+  case 0x064F:
+    rom = "u";
+    return true;
+  case 0x0670:
+    rom = "a";
+    return true;
   case 0x064B:
   case 0x064C:
   case 0x064D:
   case 0x0651:
   case 0x0652:
   case 0x0654:
-  case 0x0655: rom = ""; return true;
-  case 0x06D4: rom = "."; return true;
-  case 0x060C: rom = ","; return true;
-  case 0x061F: rom = "?"; return true;
+  case 0x0655:
+    rom = "";
+    return true;
+  case 0x06D4:
+    rom = ".";
+    return true;
+  case 0x060C:
+    rom = ",";
+    return true;
+  case 0x061F:
+    rom = "?";
+    return true;
   default:
     if (cp >= 0x0660 && cp <= 0x0669) {
-      static const char *digits[10] = {"0","1","2","3","4","5","6","7","8","9"};
+      static const char *digits[10] = {"0", "1", "2", "3", "4",
+                                       "5", "6", "7", "8", "9"};
       rom = digits[cp - 0x0660];
       return true;
     }
     if (cp >= 0x06F0 && cp <= 0x06F9) {
-      static const char *digits[10] = {"0","1","2","3","4","5","6","7","8","9"};
+      static const char *digits[10] = {"0", "1", "2", "3", "4",
+                                       "5", "6", "7", "8", "9"};
       rom = digits[cp - 0x06F0];
       return true;
     }
@@ -355,7 +610,8 @@ inline std::string toLcd(const std::string &rawIn, bool kanaMode) {
   for (std::size_t i = 0; i < cps.size(); ++i) {
     unsigned cp = cps[i];
 
-    // 1. All Brahmic Indic Scripts (Hindi, Marathi, Haryanvi, Bhojpuri, Punjabi, Bengali, etc.)
+    // 1. All Brahmic Indic Scripts (Hindi, Marathi, Haryanvi, Bhojpuri,
+    // Punjabi, Bengali, etc.)
     if (isIndicCp(cp)) {
       const unsigned block = cp & 0xFF80;
       const unsigned off = cp & 0x7F;
@@ -577,6 +833,16 @@ public:
 
   bool enabled() const { return enabled_; }
   bool connected() const { return fd_ >= 0; }
+  void setEnabled(bool on) {
+    if (on != enabled_)
+      toggle();
+  }
+  bool kana() const { return kanaMode_; }
+  void setKana(bool on) {
+    kanaMode_ = on;
+    last_.clear();
+    cachedOut_.clear();
+  }
   const std::string &port() const { return port_; }
 
   void toggle() {
@@ -598,13 +864,12 @@ public:
       pollfd pfd{fd_, POLLOUT, 0};
       struct stat stPath{}, stFd{};
       int mstat = 0;
-      const bool dead =
-          (::poll(&pfd, 1, 0) < 0) ||
-          ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) ||
-          (::stat(port_.c_str(), &stPath) != 0) ||
-          (::fstat(fd_, &stFd) != 0) ||
-          (stPath.st_ino != stFd.st_ino) ||
-          (::ioctl(fd_, TIOCMGET, &mstat) < 0);
+      const bool dead = (::poll(&pfd, 1, 0) < 0) ||
+                        ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) ||
+                        (::stat(port_.c_str(), &stPath) != 0) ||
+                        (::fstat(fd_, &stFd) != 0) ||
+                        (stPath.st_ino != stFd.st_ino) ||
+                        (::ioctl(fd_, TIOCMGET, &mstat) < 0);
       if (dead) {
         close_port();
         nextTry_ = now + std::chrono::milliseconds(500);
@@ -650,8 +915,8 @@ private:
   bool open_port() {
     const char *env = std::getenv("MUZX_LCD_PORT");
     const std::string candidates[] = {
-        env ? env : "",  "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2",
-        "/dev/ttyACM0",  "/dev/ttyACM1", "/dev/ttyACM2"};
+        env ? env : "", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2",
+        "/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2"};
     for (const std::string &p : candidates) {
       if (p.empty())
         continue;
