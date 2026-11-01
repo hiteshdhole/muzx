@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <filesystem>
@@ -32,12 +34,16 @@
 #include <vector>
 
 #include <signal.h>
+#include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
+
+extern char **environ; // for posix_spawn (notifications)
 
 namespace {
 
@@ -55,20 +61,60 @@ constexpr const char *kLyricNear = "\033[37m"; // light grey
 struct Theme {
   const char *name, *title, *accent, *green, *cyan, *muted, *lyric;
 };
-const Theme kThemes[] = {{"Purple", "\033[1;35m", "\033[95m", "\033[1;32m",
-                          "\033[1;36m", "\033[90m", "\033[1;95m"},
-                         {"Ocean", "\033[1;34m", "\033[96m", "\033[1;36m",
-                          "\033[1;94m", "\033[90m", "\033[1;96m"},
-                         {"Forest", "\033[1;32m", "\033[93m", "\033[1;92m",
-                          "\033[1;33m", "\033[90m", "\033[1;93m"},
-                         {"Sunset", "\033[1;31m", "\033[93m", "\033[1;33m",
-                          "\033[1;91m", "\033[90m", "\033[1;93m"},
-                         {"Mono", "\033[1;37m", "\033[97m", "\033[1;37m",
-                          "\033[37m", "\033[90m", "\033[1;97m"}};
-constexpr int kThemeCount = 5;
+const Theme kThemes[] = {
+    {"Purple", "\033[1;35m", "\033[95m", "\033[1;32m", "\033[1;36m", "\033[90m",
+     "\033[1;95m"},
+    {"Ocean", "\033[1;34m", "\033[96m", "\033[1;36m", "\033[1;94m", "\033[90m",
+     "\033[1;96m"},
+    {"Forest", "\033[1;32m", "\033[93m", "\033[1;92m", "\033[1;33m", "\033[90m",
+     "\033[1;93m"},
+    {"Sunset", "\033[1;31m", "\033[93m", "\033[1;33m", "\033[1;91m", "\033[90m",
+     "\033[1;93m"},
+    {"Mono", "\033[1;37m", "\033[97m", "\033[1;37m", "\033[37m", "\033[90m",
+     "\033[1;97m"},
+    {"Custom", "", "", "", "", "\033[90m", ""}}; // filled in from g_custom
+constexpr int kThemeCount = 6;
+constexpr int kCustomTheme = 5;
+
+// Colours the theme editor can pick from (256-colour codes).
+struct PaletteColor {
+  const char *name;
+  int code;
+};
+const PaletteColor kPalette[] = {
+    {"Red", 196},   {"Orange", 208}, {"Yellow", 220},  {"Lime", 118},
+    {"Green", 40},  {"Teal", 37},    {"Cyan", 51},     {"Sky", 39},
+    {"Blue", 33},   {"Purple", 135}, {"Magenta", 201}, {"Pink", 213},
+    {"White", 255}, {"Grey", 250}};
+constexpr int kPaletteCount = 14;
+int g_custom[4] = {10, 11, 4, 6}; // title, accent, highlight, bars
+std::string g_customCode[5];      // the escape codes built from g_custom
 
 void applyTheme(int index) {
-  const Theme &t = kThemes[((index % kThemeCount) + kThemeCount) % kThemeCount];
+  index = ((index % kThemeCount) + kThemeCount) % kThemeCount;
+  if (index == kCustomTheme) {
+    auto code = [](int slot, bool bold) {
+      const int c =
+          kPalette[((g_custom[slot] % kPaletteCount) + kPaletteCount) %
+                   kPaletteCount]
+              .code;
+      return std::string(bold ? "\033[1;38;5;" : "\033[38;5;") +
+             std::to_string(c) + "m";
+    };
+    g_customCode[0] = code(0, true);  // title
+    g_customCode[1] = code(1, false); // accent
+    g_customCode[2] = code(2, true);  // highlight
+    g_customCode[3] = code(3, true);  // bars (low part)
+    g_customCode[4] = code(1, true);  // current lyric line
+    kPurpleBold = g_customCode[0].c_str();
+    kPink = g_customCode[1].c_str();
+    kGreenBold = g_customCode[2].c_str();
+    kCyanBold = g_customCode[3].c_str();
+    kMuted = "\033[90m";
+    kLyricCurrent = g_customCode[4].c_str();
+    return;
+  }
+  const Theme &t = kThemes[index];
   kPurpleBold = t.title;
   kPink = t.accent;
   kGreenBold = t.green;
@@ -95,8 +141,21 @@ enum Key : int {
   KeyShiftTab,
   KeyEnter,
   KeyBackspace,
+  KeyMouse,  // a mouse event: see lastMouse
   KeyUnknown // recognised-but-ignored input (Delete, Alt+x, F-keys, ...)
 };
+
+// Mouse reporting (SGR mode). MUZX_MOUSE=0 turns the mouse off. While it is on,
+// hold Shift to select text with the mouse as usual.
+struct MouseEvent {
+  int button = 0, x = 0, y = 0;
+  bool press = false;
+};
+MouseEvent lastMouse;
+bool mouseWanted() {
+  const char *env = std::getenv("MUZX_MOUSE");
+  return !(env && std::string(env) == "0");
+}
 
 termios originalTerminal{};
 bool rawModeEnabled = false;
@@ -131,13 +190,18 @@ void enableRawMode() {
   raw.c_cc[VMIN] = 0;
   raw.c_cc[VTIME] = 0;
 
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
+  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) {
     rawModeEnabled = true;
+    if (mouseWanted())
+      std::cout << "\033[?1000h\033[?1006h" << std::flush;
+  }
 }
 
 void disableRawMode() {
   if (!rawModeEnabled)
     return;
+  if (mouseWanted())
+    std::cout << "\033[?1000l\033[?1006l" << std::flush;
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &originalTerminal);
   rawModeEnabled = false;
 }
@@ -160,16 +224,55 @@ public:
 // Redirects std::cout into a string for the lifetime of the object.
 class CoutCapture {
 public:
-  CoutCapture() : old_(std::cout.rdbuf(buffer_.rdbuf())) {}
-  ~CoutCapture() { std::cout.rdbuf(old_); }
+  CoutCapture() : old_(std::cout.rdbuf(buffer_.rdbuf())), previous_(current_) {
+    current_ = this;
+  }
+  ~CoutCapture() {
+    current_ = previous_;
+    std::cout.rdbuf(old_);
+  }
+  // Number of finished lines captured so far (the newest capture).
+  static int rowsSoFar() {
+    if (!current_)
+      return 0;
+    const std::string text = current_->buffer_.str();
+    return static_cast<int>(std::count(text.begin(), text.end(), '\n'));
+  }
   CoutCapture(const CoutCapture &) = delete;
   CoutCapture &operator=(const CoutCapture &) = delete;
   std::string str() const { return buffer_.str(); }
 
 private:
+  static inline CoutCapture *current_ = nullptr;
   std::ostringstream buffer_;
   std::streambuf *old_;
+  CoutCapture *previous_;
 };
+
+// ---------------------------------------------------------------------------
+// Clickable areas. The drawing code registers them while it draws; a mouse
+// click is then matched against this list (rows and columns are 1-based).
+// ---------------------------------------------------------------------------
+enum ClickAction {
+  ClkTab,
+  ClkShuffle,
+  ClkPrev,
+  ClkPlayPause,
+  ClkNext,
+  ClkRepeat,
+  ClkSeek,
+  ClkListItem,
+  ClkSetting
+};
+struct ClickRegion {
+  int row0, row1, col0, col1, action, arg;
+};
+std::vector<ClickRegion> g_clicks;
+int g_buttonsRow = 0; // screen row of the Player "Status:" line (0 = none)
+
+void addClick(int row0, int row1, int col0, int col1, int action, int arg = 0) {
+  g_clicks.push_back({row0, row1, col0, col1, action, arg});
+}
 
 int terminalRows() {
   winsize w{};
@@ -251,9 +354,20 @@ int readKey() {
     // CSI: parameters, then one final byte in 0x40..0x7E. Always consume the
     // whole sequence so its tail is never mistaken for key presses.
     char c = '\0';
-    for (int i = 0; i < 16 && readByte(c, kEscapeTimeoutMs); ++i) {
-      if (c >= 0x40 && c <= 0x7E)
+    std::string params;
+    for (int i = 0; i < 24 && readByte(c, kEscapeTimeoutMs); ++i) {
+      if (c >= 0x40 && c <= 0x7E) {
+        if (!params.empty() && params[0] == '<' && (c == 'M' || c == 'm')) {
+          int b = 0, x = 0, y = 0;
+          if (std::sscanf(params.c_str() + 1, "%d;%d;%d", &b, &x, &y) == 3) {
+            lastMouse = {b, x, y, c == 'M'};
+            return KeyMouse;
+          }
+          return KeyUnknown;
+        }
         return arrowKey(c);
+      }
+      params += c;
     }
     return KeyUnknown;
   }
@@ -438,6 +552,8 @@ std::string fileName(const std::string &path) {
 
 enum class LyricsMode { Off, Right, Bottom }; // "L" cycles these
 
+enum class RepeatMode { Off, All, One }; // "R" and the loop button
+
 enum class AppTab {
   Player = 0,
   Folders = 1,
@@ -468,6 +584,10 @@ struct AppState {
   bool playbackRunning = false;
   bool paused = false;
   bool shuffle = false;
+  RepeatMode repeat = RepeatMode::Off;
+  bool compact = false;    // Settings: hide the hint lines
+  bool showButtons = true; // Settings: the clickable control buttons
+  bool notify = false;     // Settings: desktop notification on song change
   bool showAlbumArt = false;
   bool showVisualizer = false;
   LyricsMode lyricsMode = LyricsMode::Right; // "L": Off -> Right -> Bottom
@@ -736,10 +856,14 @@ void checkAutomaticNext(AppState &app) {
   if (!app.player.isFinished())
     return;
 
-  if (app.shuffle && app.playlist.size() > 1) {
+  if (app.repeat == RepeatMode::One) {
+    playFromPlaylist(app, app.playlist, app.playlistIndex, false);
+  } else if (app.shuffle && app.playlist.size() > 1) {
     playFromPlaylist(app, app.playlist, pickNextIndex(app), false);
   } else if (app.playlistIndex + 1 < app.playlist.size()) {
     playFromPlaylist(app, app.playlist, app.playlistIndex + 1, false);
+  } else if (app.repeat == RepeatMode::All && !app.playlist.empty()) {
+    playFromPlaylist(app, app.playlist, 0, false);
   } else {
     app.playbackRunning = false;
   }
@@ -846,8 +970,14 @@ void showTabs(AppTab active) {
   const char *names[] = {"1 Player", "2 Folders", "3 Queue",   "4 Search",
                          "5 Status", "6 Keys",    "7 Settings"};
 
+  const int tabRow = CoutCapture::rowsSoFar() + 1;
+  int tabCol = 7; // after "MUZX  "
   for (int i = 0; i < kTabCount; ++i) {
     AppTab tab = static_cast<AppTab>(i);
+    const int tabWidth =
+        static_cast<int>(std::strlen(names[i])) + (tab == active ? 2 : 0);
+    addClick(tabRow, tabRow, tabCol, tabCol + tabWidth - 1, ClkTab, i);
+    tabCol += tabWidth + 2;
     if (tab == active)
       std::cout << kSelected << " " << names[i] << " " << kReset << "  ";
     else
@@ -879,7 +1009,10 @@ void drawList(const std::vector<std::string> &labels,
   if (start > 0)
     std::cout << kMuted << "  ...\n" << kReset;
 
+  int listRow = CoutCapture::rowsSoFar() + 1;
   for (std::size_t i = start; i < end; ++i) {
+    addClick(listRow, listRow, 1, 9999, ClkListItem, static_cast<int>(i));
+    ++listRow;
     if (i == selectedIndex)
       std::cout << kGreenBold << " > " << labels[i] << kReset << "\n";
     else
@@ -1019,6 +1152,8 @@ void drawPlayer(const AppState &app) {
     else
       std::cout << "  Status:  Stopped / Finished\n";
 
+    g_buttonsRow = CoutCapture::rowsSoFar(); // the Status line just printed
+
     constexpr int width = 30;
     int filled =
         duration > 0.1F
@@ -1026,6 +1161,8 @@ void drawPlayer(const AppState &app) {
                          width)
             : 0;
 
+    const int barRow = CoutCapture::rowsSoFar() + 1;
+    addClick(barRow, barRow, 4, 3 + width, ClkSeek, 0); // click = jump there
     std::cout << "  [";
     for (int i = 0; i < width; ++i)
       std::cout << (i < filled ? '#' : '-');
@@ -1057,11 +1194,12 @@ void drawPlayer(const AppState &app) {
     std::cout << "\n";
   }
 
-  std::cout << kMuted << "  Space Play/Pause  |  ←/→ Seek  |  i Art ("
-            << (app.showAlbumArt ? "ON" : "OFF") << ")  |  v Vis ("
-            << (app.showVisualizer ? "ON" : "OFF") << ")  |  L Lyrics ("
-            << (app.lyricsMode != LyricsMode::Off ? "ON" : "OFF") << ")\n"
-            << kReset;
+  if (!app.compact)
+    std::cout << kMuted << "  Space Play/Pause  |  ←/→ Seek  |  i Art ("
+              << (app.showAlbumArt ? "ON" : "OFF") << ")  |  v Vis ("
+              << (app.showVisualizer ? "ON" : "OFF") << ")  |  L Lyrics ("
+              << (app.lyricsMode != LyricsMode::Off ? "ON" : "OFF") << ")\n"
+              << kReset;
 }
 
 void drawFolders(const AppState &app) {
@@ -1178,13 +1316,17 @@ void drawKeybindings() {
   row("h / l", "Previous / next song on Player");
   row("n / b", "Next / previous song (global)");
   row("s", "Toggle shuffle");
+  row("R", "Repeat: off / all songs / one song");
   row("i", "Toggle Album Art");
   row("v", "Toggle Audio Visualizer");
   row("L", "Lyrics: right panel / below / off");
   row("G", "Generate lyrics with Whisper (G again cancels)");
   row("A", "Auto-generate lyrics when none exist");
+  row("T", "Show the lyrics on the Arduino LCD (on / off)");
   row("+ / -", "Adjust volume");
   row("x", "Stop playback");
+  row("Mouse",
+      "Click tabs, buttons, progress bar, list rows; wheel = scroll / volume");
 
   std::cout << "\n";
   section("NAVIGATION & TABS");
@@ -1281,6 +1423,9 @@ bool serviceMpris(AppState &app) {
   state.volume =
       std::clamp(static_cast<double>(app.player.getVolume()) / 100.0, 0.0, 1.0);
   state.shuffle = app.shuffle;
+  state.loop = app.repeat == RepeatMode::One   ? "Track"
+               : app.repeat == RepeatMode::All ? "Playlist"
+                                               : "None";
   state.canNext = state.canPrevious =
       app.hasCurrentSong && !app.playlist.empty();
   app.mpris.publish(state);
@@ -1332,6 +1477,11 @@ bool serviceMpris(AppState &app) {
     case MprisCmd::SetShuffle:
       app.shuffle = cmd.value != 0.0;
       break;
+    case MprisCmd::SetLoop:
+      app.repeat = cmd.value >= 2.0   ? RepeatMode::One
+                   : cmd.value >= 1.0 ? RepeatMode::All
+                                      : RepeatMode::Off;
+      break;
     case MprisCmd::Quit:
       return true;
     }
@@ -1340,11 +1490,73 @@ bool serviceMpris(AppState &app) {
 }
 
 // ---------------------------------------------------------------------------
+// Desktop notification when a new song starts (needs notify-send / libnotify)
+// ---------------------------------------------------------------------------
+
+bool commandExists(const std::string &name) {
+  const char *path = std::getenv("PATH");
+  if (!path)
+    return false;
+  std::istringstream in(path);
+  std::string dir;
+  while (std::getline(in, dir, ':')) {
+    if (!dir.empty() && ::access((dir + "/" + name).c_str(), X_OK) == 0)
+      return true;
+  }
+  return false;
+}
+
+void sendNotification(const std::string &title, const std::string &body) {
+  std::vector<std::string> args = {
+      "notify-send",
+      "-a",
+      "MUZX",
+      "-t",
+      "4000",
+      "-h",
+      "string:x-canonical-private-synchronous:muzx",
+      "--",
+      title,
+      body};
+  std::vector<char *> argv;
+  for (std::string &a : args)
+    argv.push_back(a.data());
+  argv.push_back(nullptr);
+
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions); // keep its output off the screen
+  for (int fd = 0; fd <= 2; ++fd)
+    posix_spawn_file_actions_addopen(&actions, fd, "/dev/null",
+                                     fd == 0 ? O_RDONLY : O_WRONLY, 0);
+  pid_t pid = 0;
+  if (posix_spawnp(&pid, "notify-send", &actions, nullptr, argv.data(),
+                   environ) == 0)
+    std::thread([pid] {
+      int status = 0;
+      waitpid(pid, &status, 0); // reap it so no zombie is left behind
+    }).detach();
+  posix_spawn_file_actions_destroy(&actions);
+}
+
+void notifySongChange(AppState &app) {
+  static std::string lastSong;
+  if (app.currentSong == lastSong)
+    return;
+  lastSong = app.currentSong;
+  if (!app.notify || !app.hasCurrentSong || !app.playbackRunning)
+    return;
+  std::string title, artist;
+  splitSongName(app.currentSong, title, artist);
+  sendNotification(title, artist.empty() ? "MUZX" : artist);
+}
+
+// ---------------------------------------------------------------------------
 // Settings tab
 // ---------------------------------------------------------------------------
 
 enum SettingItem {
-  SetLyrics = 0,
+  SetRepeat = 0, // playback
+  SetLyrics,
   SetAutoGen,
   SetModel,
   SetLang, // lyrics
@@ -1352,8 +1564,15 @@ enum SettingItem {
   SetLcdKana, // LCD
   SetArt,
   SetVisualizer,
+  SetLayout,
+  SetButtons,
+  SetNotify, // display
   SetTheme,
-  SetFont,   // display
+  SetColTitle,
+  SetColAccent,
+  SetColHighlight,
+  SetColBars,
+  SetFont,   // look
   SetFolder, // general
   kSettingCount
 };
@@ -1404,7 +1623,8 @@ std::string applyFontSize(int size) {
 
 std::string settingsToText(const AppState &app) {
   std::ostringstream out;
-  out << "lyrics_mode=" << static_cast<int>(app.lyricsMode) << "\n"
+  out << "repeat=" << static_cast<int>(app.repeat) << "\n"
+      << "lyrics_mode=" << static_cast<int>(app.lyricsMode) << "\n"
       << "auto_generate=" << (app.lyricsAutoGen ? 1 : 0) << "\n"
       << "whisper_model=" << app.whisperModel << "\n"
       << "whisper_lang=" << app.whisperLang << "\n"
@@ -1412,6 +1632,13 @@ std::string settingsToText(const AppState &app) {
       << "lcd_kana=" << (app.lcd.kana() ? 1 : 0) << "\n"
       << "album_art=" << (app.showAlbumArt ? 1 : 0) << "\n"
       << "visualizer=" << (app.showVisualizer ? 1 : 0) << "\n"
+      << "compact=" << (app.compact ? 1 : 0) << "\n"
+      << "buttons=" << (app.showButtons ? 1 : 0) << "\n"
+      << "notify=" << (app.notify ? 1 : 0) << "\n"
+      << "color_title=" << g_custom[0] << "\n"
+      << "color_accent=" << g_custom[1] << "\n"
+      << "color_highlight=" << g_custom[2] << "\n"
+      << "color_bars=" << g_custom[3] << "\n"
       << "theme=" << kThemes[app.theme].name << "\n"
       << "font_size=" << app.fontSize << "\n";
   return out.str();
@@ -1446,6 +1673,11 @@ void loadSettings(AppState &app) {
     if (it != values.end())
       out = it->second == "1";
   };
+  if (values.count("repeat")) {
+    const int mode = std::atoi(values["repeat"].c_str());
+    if (mode >= 0 && mode <= 2)
+      app.repeat = static_cast<RepeatMode>(mode);
+  }
   if (values.count("lyrics_mode")) {
     const int mode = std::atoi(values["lyrics_mode"].c_str());
     if (mode >= 0 && mode <= 2)
@@ -1453,6 +1685,15 @@ void loadSettings(AppState &app) {
   }
   flag("auto_generate", app.lyricsAutoGen);
   flag("album_art", app.showAlbumArt);
+  flag("compact", app.compact);
+  flag("buttons", app.showButtons);
+  flag("notify", app.notify);
+  static const char *const colorKeys[4] = {"color_title", "color_accent",
+                                           "color_highlight", "color_bars"};
+  for (int k = 0; k < 4; ++k)
+    if (values.count(colorKeys[k]))
+      g_custom[k] = std::clamp(std::atoi(values[colorKeys[k]].c_str()), 0,
+                               kPaletteCount - 1);
   flag("visualizer", app.showVisualizer);
   if (values.count("lcd"))
     app.lcd.setEnabled(values["lcd"] == "1");
@@ -1477,6 +1718,10 @@ void loadSettings(AppState &app) {
 void changeSetting(AppState &app, int item, int dir) {
   app.settingsNote.clear();
   switch (item) {
+  case SetRepeat:
+    app.repeat = static_cast<RepeatMode>(
+        cycleIndex(static_cast<int>(app.repeat), dir, 3));
+    break;
   case SetLyrics:
     app.lyricsMode = static_cast<LyricsMode>(
         cycleIndex(static_cast<int>(app.lyricsMode), dir, 3));
@@ -1514,10 +1759,32 @@ void changeSetting(AppState &app, int item, int dir) {
   case SetVisualizer:
     app.showVisualizer = !app.showVisualizer;
     break;
+  case SetLayout:
+    app.compact = !app.compact;
+    break;
+  case SetButtons:
+    app.showButtons = !app.showButtons;
+    break;
+  case SetNotify:
+    app.notify = !app.notify;
+    if (app.notify && !commandExists("notify-send"))
+      app.settingsNote = "notify-send not found: install libnotify (sudo "
+                         "pacman -S libnotify).";
+    break;
   case SetTheme:
     app.theme = cycleIndex(app.theme, dir, kThemeCount);
     applyTheme(app.theme);
     break;
+  case SetColTitle:
+  case SetColAccent:
+  case SetColHighlight:
+  case SetColBars: {
+    int &slot = g_custom[item - SetColTitle];
+    slot = cycleIndex(slot, dir, kPaletteCount);
+    app.theme = kCustomTheme; // picking a colour switches to the Custom theme
+    applyTheme(app.theme);
+    break;
+  }
   case SetFont: {
     const int n =
         static_cast<int>(sizeof(kFontChoices) / sizeof(kFontChoices[0]));
@@ -1570,6 +1837,10 @@ void askMusicFolder(AppState &app) {
 std::string settingValue(const AppState &app, int item) {
   auto onOff = [](bool v) { return std::string(v ? "On" : "Off"); };
   switch (item) {
+  case SetRepeat:
+    return app.repeat == RepeatMode::Off   ? "Off"
+           : app.repeat == RepeatMode::All ? "All songs"
+                                           : "One song";
   case SetLyrics:
     return app.lyricsMode == LyricsMode::Off     ? "Off"
            : app.lyricsMode == LyricsMode::Right ? "Right of the player"
@@ -1592,8 +1863,22 @@ std::string settingValue(const AppState &app, int item) {
     return onOff(app.showAlbumArt);
   case SetVisualizer:
     return onOff(app.showVisualizer);
+  case SetLayout:
+    return app.compact ? "Compact (no hint lines)" : "Normal";
+  case SetButtons:
+    return onOff(app.showButtons);
+  case SetNotify:
+    return onOff(app.notify);
   case SetTheme:
     return kThemes[app.theme].name;
+  case SetColTitle:
+  case SetColAccent:
+  case SetColHighlight:
+  case SetColBars: {
+    const int c = g_custom[item - SetColTitle];
+    return std::string(kPalette[c].name) + "  \033[38;5;" +
+           std::to_string(kPalette[c].code) + "m██\033[39m";
+  }
   case SetFont:
     return app.fontSize == 0 ? "terminal default"
                              : std::to_string(app.fontSize);
@@ -1605,21 +1890,42 @@ std::string settingValue(const AppState &app, int item) {
 }
 
 void drawSettings(const AppState &app) {
-  static const char *const labels[kSettingCount] = {
-      "Lyrics panel", "Auto-generate", "Whisper model", "Whisper language",
-      "LCD display",  "LCD Japanese",  "Album art",     "Visualizer",
-      "Theme",        "Font size",     "Music folder"};
+  static const char *const labels[kSettingCount] = {"Repeat",
+                                                    "Lyrics panel",
+                                                    "Auto-generate",
+                                                    "Whisper model",
+                                                    "Whisper language",
+                                                    "LCD display",
+                                                    "LCD Japanese",
+                                                    "Album art",
+                                                    "Visualizer",
+                                                    "Layout",
+                                                    "Control buttons",
+                                                    "Notifications",
+                                                    "Theme",
+                                                    "Custom: title",
+                                                    "Custom: accent",
+                                                    "Custom: highlight",
+                                                    "Custom: bars",
+                                                    "Font size",
+                                                    "Music folder"};
   std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
   const std::size_t selected = app.settingsCursor.current();
   for (int i = 0; i < kSettingCount; ++i) {
-    if (i == SetLyrics)
+    if (i == SetRepeat)
+      std::cout << "\n  " << kMuted << "PLAYBACK" << kReset << "\n";
+    else if (i == SetLyrics)
       std::cout << "\n  " << kMuted << "LYRICS" << kReset << "\n";
     else if (i == SetLcd)
       std::cout << "\n  " << kMuted << "LCD (Arduino)" << kReset << "\n";
     else if (i == SetArt)
       std::cout << "\n  " << kMuted << "DISPLAY" << kReset << "\n";
+    else if (i == SetTheme)
+      std::cout << "\n  " << kMuted << "THEME & FONT" << kReset << "\n";
     else if (i == SetFolder)
       std::cout << "\n  " << kMuted << "GENERAL" << kReset << "\n";
+    const int settingRow = CoutCapture::rowsSoFar() + 1;
+    addClick(settingRow, settingRow, 1, 9999, ClkSetting, i);
     std::string label = labels[i];
     label.resize(20, ' ');
     if (static_cast<std::size_t>(i) == selected)
@@ -2058,7 +2364,71 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Player buttons: shuffle, previous, play/pause, next, repeat. Drawn on top of
+// the finished frame, to the right of the Status / progress / Time lines.
+// ---------------------------------------------------------------------------
+
+int rightPanelColumn(const AppState &app, int cols) {
+  if (app.lyricsMode != LyricsMode::Right || cols < kLyricsMinCols)
+    return 0;
+  return cols >= 140 ? 88 : 82;
+}
+
+std::string playerButtons(const AppState &app, int rows, int cols) {
+  if (!app.showButtons || app.tab != AppTab::Player || !app.hasCurrentSong ||
+      g_buttonsRow <= 0)
+    return "";
+  const int startCol = 46;
+  const int panel = rightPanelColumn(app, cols);
+  const int room = (panel > 0 ? panel - 2 : cols - 1) - startCol + 1;
+  const int w = room >= 39 ? 7 : (room >= 29 ? 5 : 0); // button width
+  const int top = g_buttonsRow;
+  if (w == 0 || top + 2 > rows)
+    return "";
+
+  const bool playing = app.playbackRunning && !app.paused;
+  struct Button {
+    const char *glyph;
+    int glyphWidth;
+    std::string color;
+    int action;
+  };
+  const Button buttons[5] = {
+      {"⇄", 1, app.shuffle ? kGreenBold : kMuted, ClkShuffle},
+      {"◀◀", 2, kPink, ClkPrev},
+      {playing ? "▮▮" : "▶", playing ? 2 : 1, kPurpleBold, ClkPlayPause},
+      {"▶▶", 2, kPink, ClkNext},
+      {app.repeat == RepeatMode::One ? "↻1" : "↻",
+       app.repeat == RepeatMode::One ? 2 : 1,
+       app.repeat == RepeatMode::Off ? kMuted : kGreenBold, ClkRepeat}};
+
+  std::string out;
+  auto at = [](int row, int col) {
+    return "\033[" + std::to_string(row) + ";" + std::to_string(col) + "H";
+  };
+  for (int k = 0; k < 5; ++k) {
+    const Button &b = buttons[k];
+    const int col = startCol + k * (w + 1);
+    const int inner = w - 2;
+    const int left = (inner - b.glyphWidth) / 2;
+    const int right = inner - b.glyphWidth - left;
+    std::string line;
+    for (int i = 0; i < inner; ++i)
+      line += "─";
+    out += at(top, col) + b.color + "╭" + line + "╮";
+    out += at(top + 1, col) + b.color + "│" +
+           std::string(static_cast<std::size_t>(left), ' ') + b.glyph +
+           std::string(static_cast<std::size_t>(right), ' ') + b.color + "│";
+    out += at(top + 2, col) + b.color + "╰" + line + "╯" + kReset;
+    addClick(top, top + 2, col, col + w - 1, b.action, 0);
+  }
+  return out;
+}
+
 void drawScreen(const AppState &app) {
+  g_clicks.clear();
+  g_buttonsRow = 0;
   std::string content;
   {
     CoutCapture capture;
@@ -2091,13 +2461,14 @@ void drawScreen(const AppState &app) {
       break;
     }
 
-    std::cout
-        << kMuted
-        << "------------------------------------------------------------\n"
-        << "  Tab/1-7 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  L "
-           "Lyrics  |  "
-           "q/Esc Quit"
-        << kReset;
+    if (!app.compact)
+      std::cout
+          << kMuted
+          << "------------------------------------------------------------\n"
+          << "  Tab/1-7 Tabs  |  Space Play/Pause  |  i Art  |  v Vis  |  L "
+             "Lyrics  |  "
+             "q/Esc Quit"
+          << kReset;
     std::cout.flush();
     content = capture.str();
   }
@@ -2132,6 +2503,7 @@ void drawScreen(const AppState &app) {
 
   // Lyrics go on top of the finished frame, in the same write (no flicker).
   output += lyricsPanel(app, maxRows, terminalCols(), rowCount);
+  output += playerButtons(app, maxRows, terminalCols());
   output += "\033[H";
   std::cout << output << std::flush;
 
@@ -2160,8 +2532,135 @@ void drawScreen(const AppState &app) {
 
 enum class KeyResult { Handled, FlushInput, Quit };
 
+KeyResult handleKey(AppState &app, int key, const fs::path &queueFile);
+
+KeyResult handleMouse(AppState &app, const fs::path &queueFile) {
+  const MouseEvent m = lastMouse;
+
+  if (m.button == 64 || m.button == 65) { // wheel up / down
+    const bool up = m.button == 64;
+    auto move = [&](selection &cursor, std::size_t count) {
+      if (count == 0)
+        return;
+      if (up)
+        cursor.moveUp(count);
+      else
+        cursor.moveDown(count);
+    };
+    switch (app.tab) {
+    case AppTab::Player:
+      if (up)
+        app.player.increaseVolume();
+      else
+        app.player.decreaseVolume();
+      break;
+    case AppTab::Folders:
+      move(app.folderCursor, folderMenuSize(app));
+      break;
+    case AppTab::Queue:
+      move(app.queueCursor, app.songQueue.size());
+      break;
+    case AppTab::Search:
+      move(app.searchCursor, app.searchResults.size());
+      break;
+    case AppTab::Settings:
+      move(app.settingsCursor, kSettingCount);
+      break;
+    default:
+      break;
+    }
+    return KeyResult::Handled;
+  }
+  if (!m.press || m.button != 0) // only a plain left click
+    return KeyResult::Handled;
+
+  for (auto it = g_clicks.rbegin(); it != g_clicks.rend(); ++it) {
+    if (m.y < it->row0 || m.y > it->row1 || m.x < it->col0 || m.x > it->col1)
+      continue;
+    switch (it->action) {
+    case ClkTab:
+      app.tab = static_cast<AppTab>(it->arg);
+      break;
+    case ClkShuffle:
+      app.shuffle = !app.shuffle;
+      break;
+    case ClkPrev:
+      previousSong(app);
+      break;
+    case ClkPlayPause:
+      togglePause(app);
+      break;
+    case ClkNext:
+      nextSong(app);
+      break;
+    case ClkRepeat:
+      app.repeat =
+          static_cast<RepeatMode>((static_cast<int>(app.repeat) + 1) % 3);
+      break;
+    case ClkSeek: {
+      if (!app.hasCurrentSong)
+        break;
+      const float duration = app.player.getDuration().asSeconds();
+      const float position = app.player.getPlayingOffset().asSeconds();
+      if (!std::isfinite(duration) || duration <= 0.1F)
+        break;
+      const float fraction =
+          static_cast<float>(m.x - it->col0) /
+          static_cast<float>(std::max(1, it->col1 - it->col0));
+      const float delta =
+          std::clamp(fraction, 0.0F, 1.0F) * duration - position;
+      if (delta >= 0.0F)
+        app.player.seekForward(delta);
+      else
+        app.player.seekBackward(-delta);
+      break;
+    }
+    case ClkListItem: {
+      selection *cursor = nullptr;
+      std::size_t count = 0;
+      if (app.tab == AppTab::Folders) {
+        cursor = &app.folderCursor;
+        count = folderMenuSize(app);
+      } else if (app.tab == AppTab::Queue) {
+        cursor = &app.queueCursor;
+        count = app.songQueue.size();
+      } else if (app.tab == AppTab::Search) {
+        cursor = &app.searchCursor;
+        count = app.searchResults.size();
+      }
+      const std::size_t target = static_cast<std::size_t>(it->arg);
+      if (!cursor || target >= count)
+        break;
+      if (target == cursor->current())
+        return handleKey(
+            app, KeyEnter,
+            queueFile); // click the selected row again = open / play
+      while (cursor->current() < target)
+        cursor->moveDown(count);
+      while (cursor->current() > target)
+        cursor->moveUp(count);
+      break;
+    }
+    case ClkSetting:
+      if (static_cast<std::size_t>(it->arg) == app.settingsCursor.current())
+        return handleKey(app, KeyEnter,
+                         queueFile); // change / open the selected setting
+      while (app.settingsCursor.current() < static_cast<std::size_t>(it->arg))
+        app.settingsCursor.moveDown(kSettingCount);
+      while (app.settingsCursor.current() > static_cast<std::size_t>(it->arg))
+        app.settingsCursor.moveUp(kSettingCount);
+      break;
+    }
+    break; // the first (topmost) region wins
+  }
+  return KeyResult::Handled;
+}
+
 KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   std::error_code ec;
+
+  if (key == KeyMouse)
+    return handleMouse(app, queueFile);
 
   if (key >= '1' && key <= '7') {
     app.tab = static_cast<AppTab>(key - '1');
@@ -2213,6 +2712,11 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   }
   if (key == 's') {
     app.shuffle = !app.shuffle;
+    return KeyResult::Handled;
+  }
+  if (key == 'R') {
+    app.repeat =
+        static_cast<RepeatMode>((static_cast<int>(app.repeat) + 1) % 3);
     return KeyResult::Handled;
   }
   if (key == 'i') {
@@ -2486,6 +2990,7 @@ int run() {
 
     updateLyricsRequest(app); // start a lyrics lookup when the song changed
     updateLcd(app);
+    notifySongChange(app);
     if (serviceMpris(app))
       running = false; // the desktop asked MUZX to quit
     drawScreen(app);

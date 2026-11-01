@@ -28,10 +28,11 @@ enum class MprisCmd {
   Next,
   Previous,
   Quit,
-  SetVolume, // value: 0.0 .. 1.0
-  SeekBy,    // value: seconds (may be negative)
-  SeekTo,    // value: seconds from the start
-  SetShuffle // value: 0 or 1
+  SetVolume,  // value: 0.0 .. 1.0
+  SeekBy,     // value: seconds (may be negative)
+  SeekTo,     // value: seconds from the start
+  SetShuffle, // value: 0 or 1
+  SetLoop     // value: 0 none, 1 whole playlist, 2 this track
 };
 
 struct MprisCommand {
@@ -41,6 +42,7 @@ struct MprisCommand {
 
 struct MprisState {
   std::string status = "Stopped"; // "Playing", "Paused" or "Stopped"
+  std::string loop = "None";      // "None", "Playlist" or "Track"
   std::string title, artist;
   std::int64_t lengthUs = 0, positionUs = 0;
   double volume = 1.0;
@@ -67,11 +69,11 @@ public:
 
   void publish(const MprisState &s) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (s.status != state_.status || s.title != state_.title ||
-        s.artist != state_.artist || s.lengthUs != state_.lengthUs ||
-        s.trackId != state_.trackId || s.shuffle != state_.shuffle ||
-        s.canNext != state_.canNext || s.canPrevious != state_.canPrevious ||
-        s.hasTrack != state_.hasTrack ||
+    if (s.status != state_.status || s.loop != state_.loop ||
+        s.title != state_.title || s.artist != state_.artist ||
+        s.lengthUs != state_.lengthUs || s.trackId != state_.trackId ||
+        s.shuffle != state_.shuffle || s.canNext != state_.canNext ||
+        s.canPrevious != state_.canPrevious || s.hasTrack != state_.hasTrack ||
         std::fabs(s.volume - state_.volume) > 0.001)
       dirty_ = true;
     state_ = s;
@@ -191,7 +193,7 @@ private:
     if (p == "PlaybackStatus")
       return sd_bus_message_append(reply, "s", s.status.c_str());
     if (p == "LoopStatus")
-      return sd_bus_message_append(reply, "s", "None");
+      return sd_bus_message_append(reply, "s", s.loop.c_str());
     if (p == "Rate" || p == "MinimumRate" || p == "MaximumRate")
       return sd_bus_message_append(reply, "d", 1.0);
     if (p == "Shuffle")
@@ -218,6 +220,13 @@ private:
       if (sd_bus_message_read(value, "d", &v) < 0)
         return -EINVAL;
       self(u)->push(MprisCmd::SetVolume, v < 0 ? 0 : v > 1 ? 1 : v);
+    } else if (!std::strcmp(property, "LoopStatus")) {
+      const char *text = nullptr;
+      if (sd_bus_message_read(value, "s", &text) < 0 || !text)
+        return -EINVAL;
+      self(u)->push(MprisCmd::SetLoop, !std::strcmp(text, "Track")      ? 2.0
+                                       : !std::strcmp(text, "Playlist") ? 1.0
+                                                                        : 0.0);
     } else if (!std::strcmp(property, "Shuffle")) {
       int b = 0;
       if (sd_bus_message_read(value, "b", &b) < 0)
@@ -267,7 +276,8 @@ private:
         SD_BUS_METHOD("OpenUri", "s", "", openUri, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_PROPERTY("PlaybackStatus", "s", getPlayer, 0,
                         SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("LoopStatus", "s", getPlayer, 0, 0),
+        SD_BUS_WRITABLE_PROPERTY("LoopStatus", "s", getPlayer, setPlayer, 0,
+                                 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Rate", "d", getPlayer, 0, 0),
         SD_BUS_WRITABLE_PROPERTY("Shuffle", "b", getPlayer, setPlayer, 0,
                                  SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -319,8 +329,8 @@ private:
         if (dirty_.exchange(false))
           sd_bus_emit_properties_changed(
               bus, path, "org.mpris.MediaPlayer2.Player", "PlaybackStatus",
-              "Metadata", "Volume", "Shuffle", "CanGoNext", "CanGoPrevious",
-              nullptr);
+              "LoopStatus", "Metadata", "Volume", "Shuffle", "CanGoNext",
+              "CanGoPrevious", nullptr);
         if (r > 0)
           continue;
         sd_bus_wait(bus, 150000); // wakes for incoming calls; 150 ms at most
