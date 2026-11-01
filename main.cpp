@@ -3,6 +3,7 @@
 #include "cover.hpp"
 #include "lcd_link.hpp"
 #include "lyrics.hpp"
+#include "mpris.hpp"
 #include "queue.hpp"
 #include "selection.hpp"
 #include <algorithm>
@@ -476,6 +477,7 @@ struct AppState {
   bool whisperAvailable = false; // a whisper command was found
   std::chrono::steady_clock::time_point lyricsSongSince{};
   lyrics::Manager lyricsMgr; // finds lyrics on a background thread
+  Mpris mpris;               // desktop media keys / playerctl (D-Bus)
   LcdLink lcd; // "T": show the current lyric line on the Arduino LCD
   // Settings tab
   selection settingsCursor;
@@ -1201,6 +1203,140 @@ void drawKeybindings() {
   row("c", "Clear Queue");
   row("/", "Search songs by filename");
   row("q / Esc", "Quit MUZX");
+}
+
+// ---------------------------------------------------------------------------
+// Desktop media keys (MPRIS). Set MUZX_MPRIS=0 to turn this off.
+// ---------------------------------------------------------------------------
+
+// "SpotiDownloader.com - Title - Artist.mp3" -> title and artist.
+void splitSongName(const std::string &path, std::string &title,
+                   std::string &artist) {
+  std::string name = fs::path(path).stem().string();
+  auto isSite = [](const std::string &part) {
+    for (const char *tld : {".com", ".org", ".net", ".io", ".to", ".cc"})
+      if (part.find(tld) != std::string::npos)
+        return true;
+    return false;
+  };
+  std::vector<std::string> parts;
+  for (std::size_t pos = 0;;) {
+    const std::size_t at = name.find(" - ", pos);
+    if (at == std::string::npos) {
+      parts.push_back(name.substr(pos));
+      break;
+    }
+    parts.push_back(name.substr(pos, at - pos));
+    pos = at + 3;
+  }
+  if (parts.size() > 1 && isSite(parts.front()))
+    parts.erase(parts.begin());
+  title = parts.front();
+  artist = parts.size() > 1 ? parts.back() : "";
+}
+
+// The player only has "louder" and "quieter" steps, so walk towards the target.
+void setPlayerVolume(AppState &app, double target01) {
+  const float target = static_cast<float>(target01 * 100.0);
+  for (int i = 0; i < 30; ++i) {
+    const float before = app.player.getVolume();
+    if (std::fabs(before - target) < 2.5F)
+      break;
+    if (before < target)
+      app.player.increaseVolume();
+    else
+      app.player.decreaseVolume();
+    if (std::fabs(app.player.getVolume() - before) < 0.01F)
+      break; // reached the end of the scale
+  }
+}
+
+// Tells the desktop what is playing and does what it asked. Returns true when
+// the desktop asked MUZX to quit.
+bool serviceMpris(AppState &app) {
+  static std::string lastSong;
+  static unsigned trackId = 0;
+  if (app.currentSong != lastSong) {
+    lastSong = app.currentSong;
+    ++trackId;
+  }
+
+  const bool stopped =
+      !app.hasCurrentSong || (!app.playbackRunning && !app.paused);
+  MprisState state;
+  state.status = stopped ? "Stopped" : (app.paused ? "Paused" : "Playing");
+  state.hasTrack = app.hasCurrentSong;
+  state.trackId = trackId;
+  if (app.hasCurrentSong) {
+    splitSongName(app.currentSong, state.title, state.artist);
+    float duration = app.player.getDuration().asSeconds();
+    float position = app.player.getPlayingOffset().asSeconds();
+    if (!std::isfinite(duration) || duration < 0.0F)
+      duration = 0.0F;
+    if (!std::isfinite(position) || position < 0.0F)
+      position = 0.0F;
+    state.lengthUs = static_cast<std::int64_t>(duration * 1e6F);
+    state.positionUs = static_cast<std::int64_t>(position * 1e6F);
+  }
+  state.volume =
+      std::clamp(static_cast<double>(app.player.getVolume()) / 100.0, 0.0, 1.0);
+  state.shuffle = app.shuffle;
+  state.canNext = state.canPrevious =
+      app.hasCurrentSong && !app.playlist.empty();
+  app.mpris.publish(state);
+
+  for (const MprisCommand &cmd : app.mpris.takeCommands()) {
+    switch (cmd.type) {
+    case MprisCmd::Play:
+      if (stopped || app.paused)
+        togglePause(app);
+      break;
+    case MprisCmd::Pause:
+      if (!stopped && !app.paused)
+        togglePause(app);
+      break;
+    case MprisCmd::PlayPause:
+      togglePause(app);
+      break;
+    case MprisCmd::Stop:
+      app.player.stop();
+      app.playbackRunning = false;
+      app.paused = false;
+      break;
+    case MprisCmd::Next:
+      nextSong(app);
+      break;
+    case MprisCmd::Previous:
+      previousSong(app);
+      break;
+    case MprisCmd::SetVolume:
+      setPlayerVolume(app, cmd.value);
+      break;
+    case MprisCmd::SeekBy:
+      if (app.hasCurrentSong) {
+        if (cmd.value >= 0)
+          app.player.seekForward(static_cast<float>(cmd.value));
+        else
+          app.player.seekBackward(static_cast<float>(-cmd.value));
+      }
+      break;
+    case MprisCmd::SeekTo:
+      if (app.hasCurrentSong) {
+        const double now = app.player.getPlayingOffset().asSeconds();
+        if (cmd.value >= now)
+          app.player.seekForward(static_cast<float>(cmd.value - now));
+        else
+          app.player.seekBackward(static_cast<float>(now - cmd.value));
+      }
+      break;
+    case MprisCmd::SetShuffle:
+      app.shuffle = cmd.value != 0.0;
+      break;
+    case MprisCmd::Quit:
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,6 +2453,10 @@ int run() {
   if (app.fontSize > 0)
     applyFontSize(app.fontSize); // before the screen switches to raw mode
 
+  if (const char *mp = std::getenv("MUZX_MPRIS");
+      !(mp && std::string(mp) == "0"))
+    app.mpris.start(); // media keys, playerctl, desktop media widget
+
   installSignalHandlers();
   TerminalSession terminal;
   bool running = true;
@@ -2346,6 +2486,8 @@ int run() {
 
     updateLyricsRequest(app); // start a lyrics lookup when the song changed
     updateLcd(app);
+    if (serviceMpris(app))
+      running = false; // the desktop asked MUZX to quit
     drawScreen(app);
     std::this_thread::sleep_for(std::chrono::milliseconds(kFrameMs));
 
