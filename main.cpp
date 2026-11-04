@@ -564,6 +564,14 @@ enum class AppTab {
   Settings = 6
 };
 
+// Shuffle plays every song once in random order, then reshuffles. The history
+// lets Previous / Next walk through what was really played.
+struct ShuffleState {
+  std::vector<std::size_t> history; // playlist indices, oldest first
+  std::size_t pos = 0;              // where we are in the history
+  std::vector<std::size_t> bag;     // songs not played yet in this round
+};
+
 struct AppState {
   audio_player player;
   queue songQueue;
@@ -619,6 +627,7 @@ struct AppState {
   std::array<float, kVisBars> visPeaks{};
 
   std::mt19937 rng{std::random_device{}()};
+  ShuffleState shuffleState;
 };
 
 void loadStats(AppState &app) {
@@ -750,10 +759,93 @@ std::size_t folderMenuSize(const AppState &app) {
   return app.folderEntries.empty() ? 0 : app.folderEntries.size() + 1;
 }
 
+// ---------------------------------------------------------------------------
+// Shuffle: every song once per round (no repeats), with a history
+// ---------------------------------------------------------------------------
+
+void shuffleReset(AppState &app, std::size_t current) {
+  ShuffleState &sh = app.shuffleState;
+  sh.history.assign(1, current);
+  sh.pos = 0;
+  sh.bag.clear();
+  for (std::size_t i = 0; i < app.playlist.size(); ++i)
+    if (i != current)
+      sh.bag.push_back(i);
+}
+
+// Keeps the shuffle state in step with the song that is really playing (a
+// broken file is skipped, so the index can differ from what was asked for).
+void shuffleSync(AppState &app, bool newList) {
+  ShuffleState &sh = app.shuffleState;
+  if (newList || sh.history.empty() || sh.pos >= sh.history.size()) {
+    shuffleReset(app, app.playlistIndex);
+    return;
+  }
+  sh.history[sh.pos] = app.playlistIndex;
+  sh.bag.erase(std::remove(sh.bag.begin(), sh.bag.end(), app.playlistIndex),
+               sh.bag.end());
+}
+
+void shuffleEnsure(AppState &app) {
+  const ShuffleState &sh = app.shuffleState;
+  if (sh.history.empty() || sh.pos >= sh.history.size() ||
+      sh.history[sh.pos] != app.playlistIndex)
+    shuffleReset(app, app.playlistIndex);
+}
+
+std::size_t shuffleNextIndex(AppState &app) {
+  const std::size_t count = app.playlist.size();
+  if (count <= 1)
+    return 0;
+  shuffleEnsure(app);
+  ShuffleState &sh = app.shuffleState;
+  if (sh.pos + 1 <
+      sh.history.size()) // we stepped back earlier: go forward again
+    return sh.history[++sh.pos];
+  if (sh.bag.empty()) { // everything has played: a new round with every song
+                        // again
+    for (std::size_t i = 0; i < count; ++i)
+      sh.bag.push_back(i);
+  }
+  std::uniform_int_distribution<std::size_t> dist(0, sh.bag.size() - 1);
+  std::size_t pick = dist(app.rng);
+  if (sh.bag[pick] == app.playlistIndex && sh.bag.size() > 1)
+    pick = (pick + 1) % sh.bag.size(); // never the same song twice in a row
+  const std::size_t target = sh.bag[pick];
+  sh.bag.erase(sh.bag.begin() + static_cast<std::ptrdiff_t>(pick));
+  sh.history.push_back(target);
+  sh.pos = sh.history.size() - 1;
+  constexpr std::size_t kMaxHistory = 500;
+  if (sh.history.size() > kMaxHistory) {
+    sh.history.erase(sh.history.begin());
+    --sh.pos;
+  }
+  return target;
+}
+
+std::size_t shufflePreviousIndex(AppState &app) {
+  if (app.playlist.size() <= 1)
+    return 0;
+  shuffleEnsure(app);
+  ShuffleState &sh = app.shuffleState;
+  if (sh.pos > 0)
+    return sh.history[--sh.pos];
+  return app.playlistIndex; // nothing before this song: play it again
+}
+
+void setShuffle(AppState &app, bool on) {
+  app.shuffle = on;
+  if (on && !app.playlist.empty())
+    shuffleReset(app,
+                 app.playlistIndex); // a fresh round starting with this song
+}
+
 bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
                       std::size_t index, bool switchToPlayer = true) {
   if (songs.empty() || index >= songs.size())
     return false;
+  const bool newList =
+      &songs != &app.playlist; // a different list than the current one
 
   // `songs` may alias app.playlist, so work on a copy.
   std::vector<std::string> newPlaylist = songs;
@@ -769,6 +861,7 @@ bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
         app.player.play();
         app.playlist = std::move(newPlaylist);
         app.playlistIndex = currentIndex;
+        shuffleSync(app, newList);
         app.currentSong = path;
         app.hasCurrentSong = true;
         app.playbackRunning = true;
@@ -828,12 +921,7 @@ std::size_t pickNextIndex(AppState &app) {
     return 0;
   if (!app.shuffle)
     return (app.playlistIndex + 1) % app.playlist.size();
-
-  std::uniform_int_distribution<std::size_t> dist(0, app.playlist.size() - 2);
-  std::size_t next = dist(app.rng);
-  if (next >= app.playlistIndex)
-    ++next;
-  return next;
+  return shuffleNextIndex(app);
 }
 
 void nextSong(AppState &app) {
@@ -847,6 +935,8 @@ void previousSong(AppState &app) {
     return;
   std::size_t previous = (app.playlistIndex == 0) ? app.playlist.size() - 1
                                                   : app.playlistIndex - 1;
+  if (app.shuffle)
+    previous = shufflePreviousIndex(app); // back through what was really played
   playFromPlaylist(app, app.playlist, previous, false);
 }
 
@@ -914,8 +1004,6 @@ void addToQueue(AppState &app, const fs::path &path) {
   std::error_code ec;
   if (fs::is_directory(path, ec)) {
     auto songs = audioFilesIn(path, true);
-    if (app.shuffle)
-      std::shuffle(songs.begin(), songs.end(), app.rng);
     for (const auto &song : songs)
       app.songQueue.add(song);
   } else if (isAudioFile(path)) {
@@ -1382,14 +1470,25 @@ void setPlayerVolume(AppState &app, double target01) {
   const float target = static_cast<float>(target01 * 100.0);
   for (int i = 0; i < 30; ++i) {
     const float before = app.player.getVolume();
-    if (std::fabs(before - target) < 2.5F)
+    const float distance = std::fabs(before - target);
+    if (distance < 2.5F)
       break;
     if (before < target)
       app.player.increaseVolume();
     else
       app.player.decreaseVolume();
-    if (std::fabs(app.player.getVolume() - before) < 0.01F)
-      break; // reached the end of the scale
+    const float after = app.player.getVolume();
+    if (std::fabs(after - target) >=
+        distance) { // stuck, or stepped past the target
+      if (std::fabs(after - target) >
+          distance) { // went past: undo that last step
+        if (after > before)
+          app.player.decreaseVolume();
+        else
+          app.player.increaseVolume();
+      }
+      break;
+    }
   }
 }
 
@@ -1475,7 +1574,7 @@ bool serviceMpris(AppState &app) {
       }
       break;
     case MprisCmd::SetShuffle:
-      app.shuffle = cmd.value != 0.0;
+      setShuffle(app, cmd.value != 0.0);
       break;
     case MprisCmd::SetLoop:
       app.repeat = cmd.value >= 2.0   ? RepeatMode::One
@@ -1911,33 +2010,66 @@ void drawSettings(const AppState &app) {
                                                     "Music folder"};
   std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
   const std::size_t selected = app.settingsCursor.current();
+
+  // Build every line first, then show only the part that fits on the screen
+  // (centred on the selected row), so no setting is ever out of reach.
+  struct Line {
+    std::string text;
+    int item; // -1 for headings and blank lines
+  };
+  std::vector<Line> lines;
+  auto heading = [&](const char *title) {
+    lines.push_back({"", -1});
+    lines.push_back({std::string("  ") + kMuted + title + kReset, -1});
+  };
+  int selectedLine = 0;
   for (int i = 0; i < kSettingCount; ++i) {
     if (i == SetRepeat)
-      std::cout << "\n  " << kMuted << "PLAYBACK" << kReset << "\n";
+      heading("PLAYBACK");
     else if (i == SetLyrics)
-      std::cout << "\n  " << kMuted << "LYRICS" << kReset << "\n";
+      heading("LYRICS");
     else if (i == SetLcd)
-      std::cout << "\n  " << kMuted << "LCD (Arduino)" << kReset << "\n";
+      heading("LCD (Arduino)");
     else if (i == SetArt)
-      std::cout << "\n  " << kMuted << "DISPLAY" << kReset << "\n";
+      heading("DISPLAY");
     else if (i == SetTheme)
-      std::cout << "\n  " << kMuted << "THEME & FONT" << kReset << "\n";
+      heading("THEME & FONT");
     else if (i == SetFolder)
-      std::cout << "\n  " << kMuted << "GENERAL" << kReset << "\n";
-    const int settingRow = CoutCapture::rowsSoFar() + 1;
-    addClick(settingRow, settingRow, 1, 9999, ClkSetting, i);
+      heading("GENERAL");
     std::string label = labels[i];
     label.resize(20, ' ');
-    if (static_cast<std::size_t>(i) == selected)
-      std::cout << "  " << kSelected << " " << label << settingValue(app, i)
-                << " " << kReset << "\n";
-    else
-      std::cout << "    " << label << kPink << settingValue(app, i) << kReset
-                << "\n";
+    if (static_cast<std::size_t>(i) == selected) {
+      selectedLine = static_cast<int>(lines.size());
+      lines.push_back({"  " + std::string(kSelected) + " " + label +
+                           settingValue(app, i) + " " + kReset,
+                       i});
+    } else {
+      lines.push_back(
+          {"    " + label + kPink + settingValue(app, i) + kReset, i});
+    }
+  }
+
+  // Rows above (4) and below (hint lines, our own footer of 3) are not ours.
+  const int available =
+      std::max(4, terminalRows() - 4 - (app.compact ? 0 : 2) - 3);
+  const int total = static_cast<int>(lines.size());
+  int first = 0;
+  if (total > available)
+    first = std::clamp(selectedLine - available / 2, 0, total - available);
+  const int last = std::min(total, first + available);
+  for (int k = first; k < last; ++k) {
+    if (lines[static_cast<std::size_t>(k)].item >= 0) {
+      const int row = CoutCapture::rowsSoFar() + 1;
+      addClick(row, row, 1, 9999, ClkSetting,
+               lines[static_cast<std::size_t>(k)].item);
+    }
+    std::cout << lines[static_cast<std::size_t>(k)].text << "\n";
   }
   std::cout << "\n  " << kMuted
-            << "j/k move   Enter or →/l next value   ←/h previous value"
-            << kReset << "\n";
+            << "j/k move   Enter or →/l next value   ←/h previous value";
+  if (total > available)
+    std::cout << "   (" << (selected + 1) << "/" << kSettingCount << ")";
+  std::cout << kReset << "\n";
   if (!app.settingsNote.empty())
     std::cout << "  " << kGreenBold << app.settingsNote << kReset << "\n";
 }
@@ -2582,7 +2714,7 @@ KeyResult handleMouse(AppState &app, const fs::path &queueFile) {
       app.tab = static_cast<AppTab>(it->arg);
       break;
     case ClkShuffle:
-      app.shuffle = !app.shuffle;
+      setShuffle(app, !app.shuffle);
       break;
     case ClkPrev:
       previousSong(app);
@@ -2711,7 +2843,7 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
     return KeyResult::Handled;
   }
   if (key == 's') {
-    app.shuffle = !app.shuffle;
+    setShuffle(app, !app.shuffle);
     return KeyResult::Handled;
   }
   if (key == 'R') {
