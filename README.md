@@ -132,7 +132,7 @@ Turn it off with `MUZX_MPRIS=0`.
 `MUZX_LCD=1` (on at start), `MUZX_LCD_PORT=/dev/ttyUSB0`, `MUZX_LCD_KANA=1`
 (katakana for LCDs with the Japanese ROM).
 
-## Environment variables
+## Environment variabless
 
 | Variable                                                  | Meaning                          |
 | --------------------------------------------------------- | -------------------------------- |
