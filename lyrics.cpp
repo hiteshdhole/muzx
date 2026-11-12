@@ -24,6 +24,7 @@
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -145,6 +146,8 @@ std::string hexHash(const std::string &text) { // FNV-1a, 64 bit
 } // namespace
 
 std::string sanitize(const std::string &in) {
+  // Lyrics can come from the internet, so drop everything that could act as a
+  // terminal command (ESC and other control codes, including the C1 range).
   std::string out;
   out.reserve(in.size());
   for (std::size_t i = 0; i < in.size(); ++i) {
@@ -157,7 +160,7 @@ std::string sanitize(const std::string &in) {
       continue;
     if (c == 0xC2 && i + 1 < in.size()) {
       const unsigned char d = static_cast<unsigned char>(in[i + 1]);
-      if (d >= 0x80 && d <= 0x9F) {
+      if (d >= 0x80 && d <= 0x9F) { // U+0080..U+009F
         ++i;
         continue;
       }
@@ -182,6 +185,7 @@ std::string urlEncode(const std::string &text) {
   return out;
 }
 
+// "SpotiDownloader.com", "spotdown.org", ... : the name of a website.
 static bool looksLikeDomain(const std::string &word) {
   const std::string w = lowerCopy(word);
   const auto dot = w.rfind('.');
@@ -189,8 +193,7 @@ static bool looksLikeDomain(const std::string &word) {
     return false;
   static const char *const kTlds[] = {
       "com", "org", "net", "io", "in",  "co",   "app",  "me",
-      "fm",  "to",  "cc",  "tv", "xyz", "info", "site", "online",
-      "pk",  "se",  "ru",  "uk", "de",  "fr",   "es",   "it"};
+      "fm",  "to",  "cc",  "tv", "xyz", "info", "site", "online"};
   const std::string tld = w.substr(dot + 1);
   bool known = false;
   for (const char *t : kTlds)
@@ -205,36 +208,16 @@ static bool looksLikeDomain(const std::string &word) {
   return true;
 }
 
-static bool isJunkPhrase(const std::string &s) {
-  static const char *const kJunk[] = {
-      "official",     "video",        "audio",       "lyrics",
-      "lyric",        "visualizer",   "remaster",    "remastered",
-      "slowed",       "reverb",       "sped up",     "nightcore",
-      "320kbps",      "128kbps",      "kbps",        "hq",
-      "hd",           "4k",           "full song",   "full video",
-      "from ",        "ost",          "soundtrack",  "original",
-      "youtube",      "spotify",      "spotdown",    "pagalworld",
-      "djpunjab",     "mr-jatt",      "mp3",         "flac",
-      "m4a",          "wav",          "unplugged",   "lofi",
-      "lo-fi",        "chill",        "bass boosted"};
-  const std::string low = lowerCopy(s);
-  for (const char *j : kJunk) {
-    if (low.find(j) != std::string::npos)
-      return true;
-  }
-  return false;
-}
+// "BURNING UP FOR YOU_spotdown.org.mp3" -> "BURNING UP FOR YOU"
+// "SpotiDownloader.com - Main Agar Saamne - Abhijeet.mp3"
+//     -> "Main Agar Saamne - Abhijeet"
+std::string cleanTitleFromFilename(const std::string &path) {
+  const std::string stem = fs::path(path).stem().string();
+  std::string s = stem;
+  eraseAllCI(s, "_spotdown.org");
+  eraseAllCI(s, "spotdown.org");
 
-static std::string cleanQueryText(const std::string &raw) {
-  std::string s = raw;
-  static const char *const kWatermarks[] = {
-      "_spotdown.org", "spotdown.org", "SpotiDownloader.com",
-      "spotidownloader.com", "PagalWorld", "DJMaza", "SongsPK",
-      "y2mate.com", "ytmp3", "savefrom.net"};
-  for (const char *wm : kWatermarks)
-    eraseAllCI(s, wm);
-
-  // Drop bracketed segments (...) [...] {...}
+  // Drop anything in (...) [...] {...}: "(youtube)", "(slowed+reverb)", ...
   std::string noBrackets;
   int depth = 0;
   for (char c : s) {
@@ -247,91 +230,47 @@ static std::string cleanQueryText(const std::string &raw) {
     }
   }
 
-  // Strip "feat.", "ft.", "featuring" and everything after if at the end of a clause
-  {
-    const std::string low = lowerCopy(noBrackets);
-    for (const char *ft : {" feat.", " feat ", " ft.", " ft ", " featuring "}) {
-      const auto pos = low.find(ft);
-      if (pos != std::string::npos) {
-        const auto dashAfter = noBrackets.find(" - ", pos);
-        if (dashAfter == std::string::npos) {
-          noBrackets.erase(pos);
-        } else {
-          noBrackets.erase(pos, dashAfter - pos);
-        }
-        break;
-      }
-    }
-  }
-
-  // Strip common junk phrases outside brackets
-  for (const char *junk : {"official video", "official audio", "official music video",
-                           "lyric video", "lyrics video", "full video", "full audio",
-                           "320kbps", "128kbps", "320 kbps", "128 kbps"}) {
-    eraseAllCI(noBrackets, junk);
-  }
-
-  // Strip leading track numbers like "01. ", "01 - ", "1 - "
-  std::string trimmed = trimCopy(noBrackets);
-  {
-    std::size_t idx = 0;
-    while (idx < trimmed.size() && idx < 4 &&
-           std::isdigit(static_cast<unsigned char>(trimmed[idx]))) {
-      ++idx;
-    }
-    if (idx > 0 && idx < trimmed.size()) {
-      while (idx < trimmed.size() &&
-             (trimmed[idx] == '.' || trimmed[idx] == '-' || trimmed[idx] == ' ')) {
-        ++idx;
-      }
-      if (idx < trimmed.size())
-        trimmed.erase(0, idx);
-    }
-  }
-
-  // Collapse runs of spaces & drop domain words
-  std::istringstream words(trimmed);
-  std::string word, kept;
-  while (words >> word) {
-    if (looksLikeDomain(word))
+  // Collapse runs of spaces.
+  std::string out;
+  bool lastSpace = true;
+  for (char c : noBrackets) {
+    const bool space = (c == ' ' || c == '\t');
+    if (space && lastSpace)
       continue;
-    if (!kept.empty())
-      kept += ' ';
-    kept += word;
+    out.push_back(space ? ' ' : c);
+    lastSpace = space;
   }
+  out = trimCopy(out);
 
-  while (startsWith(kept, "- "))
-    kept.erase(0, 2);
-  while (kept.size() >= 2 && kept.compare(kept.size() - 2, 2, " -") == 0)
-    kept.erase(kept.size() - 2);
-  if (kept == "-")
-    kept.clear();
-  return trimCopy(kept);
-}
-
-static std::string primaryArtist(const std::string &artist) {
-  std::string a = cleanQueryText(artist);
-  // Split on comma, semicolon, slash, or "&" to extract primary artist as fallback
-  for (const char *sep : {", ", " & ", " / ", "; ", " x ", " X "}) {
-    const auto pos = a.find(sep);
-    if (pos != std::string::npos && pos > 0) {
-      return trimCopy(a.substr(0, pos));
+  // Drop website names and the dashes they leave behind at the ends.
+  {
+    std::istringstream words(out);
+    std::string word, kept;
+    while (words >> word) {
+      if (looksLikeDomain(word))
+        continue;
+      if (!kept.empty())
+        kept += ' ';
+      kept += word;
     }
+    out = kept;
+    while (startsWith(out, "- "))
+      out.erase(0, 2);
+    while (out.size() >= 2 && out.compare(out.size() - 2, 2, " -") == 0)
+      out.erase(out.size() - 2);
+    if (out == "-")
+      out.clear();
+    out = trimCopy(out);
   }
-  return a;
-}
-
-std::string cleanTitleFromFilename(const std::string &path) {
-  const std::string stem = fs::path(path).stem().string();
-  const std::string out = cleanQueryText(stem);
   return out.empty() ? stem : out;
 }
 
 // ===========================================================================
-// LRC / plain text parsing + Synthetic Sync
+// LRC / plain text parsing
 // ===========================================================================
 namespace {
 
+// "01:23.45" / "1:23" / "01:23:45"  ->  seconds
 bool parseTimestamp(const std::string &tag, double &seconds) {
   const auto colon = tag.find(':');
   if (colon == std::string::npos || colon == 0 || colon + 1 >= tag.size())
@@ -349,13 +288,13 @@ bool parseTimestamp(const std::string &tag, double &seconds) {
 
   const double minutes = std::strtod(tag.substr(0, colon).c_str(), nullptr);
   std::string rest = tag.substr(colon + 1);
-  std::replace(rest.begin(), rest.end(), ':', '.');
+  std::replace(rest.begin(), rest.end(), ':', '.'); // "ss:xx" -> "ss.xx"
   const double secs = std::strtod(rest.c_str(), nullptr);
   seconds = minutes * 60.0 + secs;
   return true;
 }
 
-std::string stripInlineTags(const std::string &text) {
+std::string stripInlineTags(const std::string &text) { // enhanced LRC <00:01.2>
   std::string out;
   bool inTag = false;
   for (char c : text) {
@@ -390,43 +329,12 @@ std::vector<std::string> splitLines(const std::string &text) {
   return lines;
 }
 
-// Converts plain unsynced lyrics into estimated synced timestamps across the song
-void synthesizeSync(Result &r, double duration) {
-  if (r.synced || r.lines.empty())
-    return;
-
-  // Filter out empty spacer lines so LCD and UI stay active
-  std::vector<Line> active;
-  active.reserve(r.lines.size());
-  for (const auto &l : r.lines) {
-    if (!trimCopy(l.text).empty())
-      active.push_back(l);
-  }
-  if (active.empty())
-    return;
-
-  const double totalDur = (duration > 15.0) ? duration : 180.0;
-  const double startOffset = std::min(5.0, totalDur * 0.04);
-  const double endMargin = std::min(8.0, totalDur * 0.06);
-  const double usable = std::max(10.0, totalDur - startOffset - endMargin);
-  const double step = usable / static_cast<double>(active.size());
-
-  for (std::size_t i = 0; i < active.size(); ++i) {
-    active[i].time = startOffset + i * step;
-  }
-  r.lines = std::move(active);
-  r.synced = true;
-  if (r.source.find("auto-sync") == std::string::npos) {
-    r.source += " (auto-sync)";
-  }
-}
-
 } // namespace
 
 Result parseLrc(const std::string &input) {
   Result result;
   std::string text = input;
-  if (startsWith(text, "\xEF\xBB\xBF"))
+  if (startsWith(text, "\xEF\xBB\xBF")) // UTF-8 byte order mark
     text.erase(0, 3);
 
   double offsetSeconds = 0.0;
@@ -445,7 +353,7 @@ Result parseLrc(const std::string &input) {
         stamps.push_back(t);
         i = close + 1;
       } else {
-        if (stamps.empty()) {
+        if (stamps.empty()) { // [ar:..] [ti:..] [offset:..] ...
           metaLine = true;
           const std::string lower = lowerCopy(tag);
           if (startsWith(lower, "offset:"))
@@ -478,7 +386,7 @@ Result parsePlain(const std::string &input) {
   if (startsWith(text, "\xEF\xBB\xBF"))
     text.erase(0, 3);
 
-  bool lastBlank = true;
+  bool lastBlank = true; // also drops blank lines at the very start
   for (const std::string &raw : splitLines(text)) {
     const std::string line = sanitize(trimCopy(raw));
     if (line.empty()) {
@@ -519,7 +427,7 @@ namespace {
 
 struct JsonObject {
   std::map<std::string, std::string> str;
-  std::map<std::string, double> num;
+  std::map<std::string, double> num; // numbers and true(1)/false(0)
 };
 
 void skipWs(const char *&p, const char *e) {
@@ -564,6 +472,7 @@ bool parseHex4(const char *p, const char *e, std::uint32_t &out) {
   return true;
 }
 
+// p points at the opening quote; on success p is just after the closing one.
 bool parseJsonString(const char *&p, const char *e, std::string &out) {
   if (p >= e || *p != '"')
     return false;
@@ -628,6 +537,7 @@ bool parseJsonString(const char *&p, const char *e, std::string &out) {
   return false;
 }
 
+// Skips one JSON value of any type (used for values we do not need).
 bool skipJsonValue(const char *&p, const char *e) {
   skipWs(p, e);
   if (p >= e)
@@ -706,7 +616,7 @@ bool parseJsonObject(const char *&p, const char *e, JsonObject &obj) {
     } else if (e - p >= 5 && std::string(p, 5) == "false") {
       obj.num[key] = 0.0;
       p += 5;
-    } else if (!skipJsonValue(p, e)) {
+    } else if (!skipJsonValue(p, e)) { // null, nested objects, arrays
       return false;
     }
   }
@@ -741,13 +651,15 @@ std::vector<JsonObject> parseJsonObjects(const std::string &body) {
     if (*p == '{' && parseJsonObject(p, e, obj))
       objects.push_back(std::move(obj));
     else
-      break;
+      break; // malformed: stop with what we have
   }
   return objects;
 }
 
 } // namespace
 
+// Lower-case letters and digits only (other scripts are kept as they are), so
+// "Main Agar Saamne (From "Raaz")" and "main agar saamne" can be compared.
 static std::string matchKey(const std::string &text) {
   std::string key;
   for (unsigned char c : text) {
@@ -759,94 +671,66 @@ static std::string matchKey(const std::string &text) {
   return key;
 }
 
-static bool hasWordOverlap(const std::string &a, const std::string &b) {
-  const std::string ka = matchKey(a);
-  const std::string kb = matchKey(b);
-  if (ka.empty() || kb.empty())
-    return false;
-  if (ka.find(kb) != std::string::npos || kb.find(ka) != std::string::npos)
-    return true;
-
-  // Check if any significant word (>= 4 chars) matches
-  std::istringstream iss(lowerCopy(a));
-  std::string w;
-  while (iss >> w) {
-    std::string kw = matchKey(w);
-    if (kw.size() >= 4 && kb.find(kw) != std::string::npos)
-      return true;
-  }
-  return false;
-}
-
 void pickFromLrclib(const std::string &json, double duration, Result &synced,
                     Result &plain,
                     const std::vector<std::string> &wantedTitles) {
-  constexpr double kStrictTolerance = 12.0; // seconds for primary match
-  constexpr double kLooseTolerance = 45.0;  // fallback for video edits/extended
+  constexpr double kSyncTolerance = 5.0; // seconds
   synced = Result{};
   plain = Result{};
 
-  std::vector<std::string> validWanted;
+  std::vector<std::string> wantedKeys;
   for (const std::string &title : wantedTitles) {
-    if (matchKey(title).size() >= 3)
-      validWanted.push_back(title);
+    std::string key = matchKey(title);
+    if (key.size() >= 4)
+      wantedKeys.push_back(std::move(key));
   }
 
-  const auto objects = parseJsonObjects(json);
-
-  // Pass 1: Strict title overlap + strict duration tolerance
-  // Pass 2: Any result from query + loose duration tolerance
-  for (int pass = 0; pass < 2; ++pass) {
-    double bestDiff = 1e18;
-    const double tol = (pass == 0) ? kStrictTolerance : kLooseTolerance;
-
-    for (const JsonObject &obj : objects) {
-      if (pass == 0 && !validWanted.empty()) {
-        const auto itName = obj.str.find("trackName");
-        const auto itArt = obj.str.find("artistName");
-        const std::string combined =
-            (itName != obj.str.end() ? itName->second : "") + " " +
-            (itArt != obj.str.end() ? itArt->second : "");
+  double bestDiff = 1e18;
+  for (const JsonObject &obj : parseJsonObjects(json)) {
+    // A search for "Abhijeet" also returns other songs of that artist: only
+    // accept results whose track name matches what we are looking for.
+    if (!wantedKeys.empty()) {
+      const auto itName = obj.str.find("trackName");
+      if (itName != obj.str.end()) {
+        const std::string nameKey = matchKey(itName->second);
         bool related = false;
-        for (const std::string &wanted : validWanted) {
-          if (hasWordOverlap( combined, wanted)) {
+        for (const std::string &wanted : wantedKeys) {
+          if (nameKey.size() >= 3 &&
+              (nameKey.find(wanted) != std::string::npos ||
+               wanted.find(nameKey) != std::string::npos))
             related = true;
-            break;
-          }
         }
         if (!related)
           continue;
       }
+    }
 
-      const auto itSynced = obj.str.find("syncedLyrics");
-      const auto itPlain = obj.str.find("plainLyrics");
-      const auto itDur = obj.num.find("duration");
-      const double objDuration = itDur != obj.num.end() ? itDur->second : 0.0;
+    const auto itSynced = obj.str.find("syncedLyrics");
+    const auto itPlain = obj.str.find("plainLyrics");
+    const auto itDur = obj.num.find("duration");
+    const double objDuration = itDur != obj.num.end() ? itDur->second : 0.0;
 
-      if (itSynced != obj.str.end() && !trimCopy(itSynced->second).empty()) {
-        const double diff = (duration > 0.0 && objDuration > 0.0)
-                                ? std::fabs(objDuration - duration)
-                                : 0.0;
-        if (diff <= tol && diff < bestDiff) {
-          Result r = parseLrc(itSynced->second);
-          if (!r.lines.empty()) {
-            r.source = "lrclib";
-            synced = std::move(r);
-            bestDiff = diff;
-          }
-        }
-      }
-      if (plain.lines.empty() && itPlain != obj.str.end() &&
-          !trimCopy(itPlain->second).empty()) {
-        Result r = parsePlain(itPlain->second);
+    if (itSynced != obj.str.end() && !trimCopy(itSynced->second).empty()) {
+      const double diff = (duration > 0.0 && objDuration > 0.0)
+                              ? std::fabs(objDuration - duration)
+                              : 0.0; // length unknown on either side: accept
+      if (diff <= kSyncTolerance && diff < bestDiff) {
+        Result r = parseLrc(itSynced->second);
         if (!r.lines.empty()) {
           r.source = "lrclib";
-          plain = std::move(r);
+          synced = std::move(r);
+          bestDiff = diff;
         }
       }
     }
-    if (!synced.lines.empty())
-      break;
+    if (plain.lines.empty() && itPlain != obj.str.end() &&
+        !trimCopy(itPlain->second).empty()) {
+      Result r = parsePlain(itPlain->second);
+      if (!r.lines.empty()) {
+        r.source = "lrclib";
+        plain = std::move(r);
+      }
+    }
   }
 }
 
@@ -859,6 +743,8 @@ struct Tags {
   std::string title, artist, album, lyrics;
 };
 
+// Reads tags with ffprobe. Output lines look like "TAG:title=Foo"; a value
+// can continue over following lines (multi-line lyrics).
 Tags readTags(const std::string &songPath) {
   Tags tags;
   const CommandOutput out =
@@ -884,19 +770,19 @@ Tags readTags(const std::string &songPath) {
       target = nullptr;
       if (key == "title")
         target = &tags.title;
-      else if (key == "artist" || key == "album_artist")
+      else if (key == "artist")
         target = &tags.artist;
       else if (key == "album")
         target = &tags.album;
       else if (startsWith(key, "lyrics") || startsWith(key, "unsyncedlyrics") ||
-               key == "uslt" || key == "sylt")
+               key == "uslt")
         target = &tags.lyrics;
       if (target && target->empty())
         *target = value;
       else
-        target = nullptr;
+        target = nullptr; // keep the first value of each tag only
     } else if (target) {
-      *target += "\n" + line;
+      *target += "\n" + line; // continuation of a multi-line value
     }
   }
   tags.title = trimCopy(tags.title);
@@ -916,24 +802,31 @@ std::string lrclibBase() {
   return "https://lrclib.net";
 }
 
+// Downloads one URL. `transient` is set when it failed for a reason that says
+// nothing about the lyrics (no network, timeout), so we must not remember
+// "not found" for that song.
+// Set by the worker thread: returns true once the song this lookup is for was
+// skipped, so slow network steps can be abandoned.
 thread_local const std::function<bool()> *tlsStale = nullptr;
 
 std::string fetchUrl(const std::string &url, bool &transient) {
-  if (tlsStale && (*tlsStale)()) {
+  if (tlsStale && (*tlsStale)()) { // skipped: do not ask the server any more
     transient = true;
     return "";
   }
-  const CommandOutput out = runCommand("curl -s -L -f -m 8 -A 'muzx/1.0' -- " +
+  const CommandOutput out = runCommand("curl -s -f -m 6 -A 'muzx/1.0' -- " +
                                        shellQuote(url) + " 2>/dev/null");
   if (out.status == 0)
     return out.text;
-  if (out.status != 22)
+  if (out.status != 22) // 22 = the server answered with an HTTP error (404)
     transient = true;
   return "";
 }
 
-std::string findExecutable(const std::string &name);
+std::string findExecutable(const std::string &name); // defined below
 
+// "Main Agar Saamne - Abhijeet" -> {"Main Agar Saamne", "Abhijeet"}
+// (download sites join artist and title with " - ").
 std::vector<std::string> splitDashes(const std::string &text) {
   std::vector<std::string> parts;
   std::size_t start = 0;
@@ -941,7 +834,7 @@ std::vector<std::string> splitDashes(const std::string &text) {
     const auto pos = text.find(" - ", start);
     const std::string part = trimCopy(text.substr(
         start, pos == std::string::npos ? std::string::npos : pos - start));
-    if (!part.empty() && !isJunkPhrase(part))
+    if (!part.empty())
       parts.push_back(part);
     if (pos == std::string::npos)
       break;
@@ -950,37 +843,28 @@ std::vector<std::string> splitDashes(const std::string &text) {
   return parts;
 }
 
-bool lookupOnline(const Tags &rawTags, const std::string &fallbackTitle,
+bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
                   double duration, Result &out, bool &transient) {
   const std::string base = lrclibBase();
-
-  const std::string cleanTagTitle = cleanQueryText(rawTags.title);
-  const std::string cleanTagArtist = cleanQueryText(rawTags.artist);
-  const std::string mainArtist = primaryArtist(rawTags.artist);
-  const std::string title =
-      cleanTagTitle.empty() ? fallbackTitle : cleanTagTitle;
+  const std::string title = tags.title.empty() ? fallbackTitle : tags.title;
 
   const std::vector<std::string> parts = splitDashes(title);
-  const std::vector<std::string> fileParts = splitDashes(fallbackTitle);
-
-  std::string flat;
+  std::string
+      flat; // "Main Agar Saamne - Abhijeet" -> "Main Agar Saamne Abhijeet"
   for (const std::string &p : parts)
     flat += (flat.empty() ? "" : " ") + p;
   if (flat.empty())
     flat = title;
 
-  std::vector<std::string> wanted = {flat, fallbackTitle};
+  // Search results must look like this song (by track name) to be accepted.
+  std::vector<std::string> wanted = {flat};
   for (const std::string &p : parts)
-    wanted.push_back(p);
-  for (const std::string &p : fileParts)
     wanted.push_back(p);
 
   Result plainFallback;
   bool havePlain = false;
-
+  // Returns true as soon as timestamped lyrics were found.
   auto consider = [&](const std::string &body, bool filtered = true) -> bool {
-    if (body.empty())
-      return false;
     Result synced, plain;
     pickFromLrclib(body, duration, synced, plain,
                    filtered ? wanted : std::vector<std::string>{});
@@ -995,6 +879,8 @@ bool lookupOnline(const Tags &rawTags, const std::string &fallbackTitle,
     return false;
   };
 
+  // The network is down (or this lookup was abandoned): stop asking, but keep
+  // plain lyrics if one of the earlier answers had them.
   auto giveUp = [&]() -> bool {
     if (!havePlain)
       return false;
@@ -1002,10 +888,12 @@ bool lookupOnline(const Tags &rawTags, const std::string &fallbackTitle,
     return true;
   };
 
-  // 1) Exact match by cleaned tags
-  if (!title.empty() && !cleanTagArtist.empty()) {
-    std::string url = base + "/api/get?track_name=" + urlEncode(title) +
-                      "&artist_name=" + urlEncode(cleanTagArtist);
+  // 1) exact match by tags
+  if (!tags.title.empty() && !tags.artist.empty()) {
+    std::string url = base + "/api/get?track_name=" + urlEncode(tags.title) +
+                      "&artist_name=" + urlEncode(tags.artist);
+    if (!tags.album.empty())
+      url += "&album_name=" + urlEncode(tags.album);
     if (duration > 0.0)
       url += "&duration=" +
              std::to_string(static_cast<long>(std::lround(duration)));
@@ -1014,55 +902,32 @@ bool lookupOnline(const Tags &rawTags, const std::string &fallbackTitle,
     if (transient)
       return giveUp();
   }
-
-  // 2) Search by cleaned title + primary artist
-  if (!mainArtist.empty()) {
-    const std::string songOnly = parts.empty() ? title : parts[0];
-    if (consider(fetchUrl(base + "/api/search?track_name=" +
-                              urlEncode(songOnly) + "&artist_name=" +
-                              urlEncode(mainArtist),
+  // 2) search by title + artist
+  if (!tags.artist.empty()) {
+    if (consider(fetchUrl(base + "/api/search?track_name=" + urlEncode(title) +
+                              "&artist_name=" + urlEncode(tags.artist),
                           transient)))
       return true;
     if (transient)
       return giveUp();
   }
-
-  // 3) If filename has "Artist - Title" or "Title - Artist", try explicit search
-  if (fileParts.size() >= 2) {
-    if (consider(fetchUrl(base + "/api/search?track_name=" +
-                              urlEncode(fileParts[0]) + "&artist_name=" +
-                              urlEncode(fileParts[1]),
-                          transient)))
-      return true;
-    if (consider(fetchUrl(base + "/api/search?track_name=" +
-                              urlEncode(fileParts[1]) + "&artist_name=" +
-                              urlEncode(fileParts[0]),
-                          transient)))
-      return true;
-  }
-
-  // 4) Free-text queries (most flexible on LRCLIB)
+  // 3) free-text searches (work with just a cleaned-up file name): the whole
+  // name first, then each " - " part on its own.
   std::vector<std::string> queries;
   auto addQuery = [&](const std::string &q) {
     const std::string t = trimCopy(q);
-    if (t.size() >= 2 &&
+    if (!t.empty() &&
         std::find(queries.begin(), queries.end(), t) == queries.end())
       queries.push_back(t);
   };
-
-  if (!mainArtist.empty())
-    addQuery(mainArtist + " " + (parts.empty() ? flat : parts[0]));
+  addQuery(tags.artist + " " + flat);
   addQuery(flat);
-  if (fallbackTitle != flat)
-    addQuery(fallbackTitle);
-  for (const std::string &p : parts)
-    addQuery(p);
-  for (const std::string &p : fileParts)
-    addQuery(p);
-
-  if (queries.size() > 5)
-    queries.resize(5);
-
+  if (parts.size() > 1) {
+    for (const std::string &p : parts)
+      addQuery(p);
+  }
+  if (queries.size() > 3)
+    queries.resize(3);
   for (const std::string &q : queries) {
     if (consider(fetchUrl(base + "/api/search?q=" + urlEncode(q), transient)))
       return true;
@@ -1077,8 +942,7 @@ bool lookupOnline(const Tags &rawTags, const std::string &fallbackTitle,
   return false;
 }
 
-std::optional<Result> loadSidecar(const std::string &songPath,
-                                  double duration) {
+std::optional<Result> loadSidecar(const std::string &songPath) {
   fs::path p = songPath;
   for (const char *ext : {".lrc", ".LRC", ".txt"}) {
     p.replace_extension(ext);
@@ -1093,7 +957,6 @@ std::optional<Result> loadSidecar(const std::string &songPath,
       r = parsePlain(*data);
     if (!r.lines.empty()) {
       r.source = std::string("local ") + ext;
-      synthesizeSync(r, duration);
       return r;
     }
   }
@@ -1101,7 +964,7 @@ std::optional<Result> loadSidecar(const std::string &songPath,
 }
 
 std::optional<Result> loadCache(const fs::path &cacheDir,
-                                const std::string &key, double duration) {
+                                const std::string &key) {
   for (const char *ext : {".lrc", ".gen.lrc", ".txt"}) {
     const std::string e = ext;
     const fs::path p = cacheDir / "lyrics" / (key + e);
@@ -1111,7 +974,6 @@ std::optional<Result> loadCache(const fs::path &cacheDir,
     Result r = e == ".txt" ? parsePlain(*data) : parseLrc(*data);
     if (!r.lines.empty()) {
       r.source = e == ".gen.lrc" ? "generated" : "cache";
-      synthesizeSync(r, duration);
       return r;
     }
   }
@@ -1126,6 +988,20 @@ void saveCache(const fs::path &cacheDir, const std::string &key,
                   toLrc(r));
 }
 
+// "Not found" is remembered for 3 days so we do not ask the server on every
+// single play of a song it does not have.
+bool recentlyNotFound(const fs::path &cacheDir, const std::string &key) {
+  std::error_code ec;
+  const fs::path marker = cacheDir / "lyrics" / (key + ".none");
+  const auto t = fs::last_write_time(marker, ec);
+  if (ec)
+    return false;
+  return (fs::file_time_type::clock::now() - t) < std::chrono::hours(72);
+}
+
+// Second online source: the `syncedlyrics` command-line tool (pipx install
+// syncedlyrics) searches Musixmatch, NetEase, Megalobiz and others for timed
+// lyrics. It is optional; without it this step is skipped.
 bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
                         double duration, const fs::path &cacheDir, Result &out,
                         bool &transient) {
@@ -1137,14 +1013,13 @@ bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
     return false;
   }
 
-  const std::string cleanTitle = cleanQueryText(tags.title);
-  const std::string title = cleanTitle.empty() ? fallbackTitle : cleanTitle;
+  const std::string title = tags.title.empty() ? fallbackTitle : tags.title;
   std::string term;
   for (const std::string &part : splitDashes(title))
     term += (term.empty() ? "" : " ") + part;
   if (term.empty())
     term = title;
-  term = trimCopy(primaryArtist(tags.artist) + " " + term);
+  term = trimCopy(tags.artist + " " + term);
   if (term.empty())
     return false;
 
@@ -1156,19 +1031,20 @@ bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
   fs::create_directories(workDir, ec);
   const fs::path outPath = workDir / "out.lrc";
 
+  // `timeout` keeps a stuck provider from blocking the lookup thread.
   const CommandOutput run = runCommand(
       "timeout 20 " + shellQuote(bin) + " -o " + shellQuote(outPath.string()) +
       " -- " + shellQuote(term) + " </dev/null 2>/dev/null");
   bool found = false;
   if (run.status != 0) {
-    transient = true;
+    transient = true; // tool crashed, timed out or no network
   } else if (const auto data = readFile(outPath)) {
     Result r = parseLrc(*data);
-    if (r.lines.empty())
-      r = parsePlain(*data);
-    if (!r.lines.empty()) {
+    // A version of the song with a different length would be out of sync.
+    const bool tooLong = duration > 0.0 && !r.lines.empty() &&
+                         r.lines.back().time > duration + 15.0;
+    if (!r.lines.empty() && !tooLong) {
       r.source = "syncedlyrics";
-      synthesizeSync(r, duration);
       out = std::move(r);
       found = true;
     }
@@ -1179,17 +1055,18 @@ bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
 
 std::optional<Result> findLyrics(const std::string &songPath, double duration,
                                  const fs::path &cacheDir, bool online) {
-  if (auto r = loadSidecar(songPath, duration))
+  if (auto r = loadSidecar(songPath))
     return r;
 
   const std::string key = hexHash(songPath);
   if (!cacheDir.empty()) {
-    if (auto r = loadCache(cacheDir, key, duration))
+    if (auto r = loadCache(cacheDir, key))
       return r;
   }
 
   const Tags tags = readTags(songPath);
 
+  // Synced lyrics stored inside the tags win over a web lookup.
   Result embedded;
   if (!trimCopy(tags.lyrics).empty()) {
     embedded = parseLrc(tags.lyrics);
@@ -1200,12 +1077,13 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
       return embedded;
   }
 
-  if (online) {
+  if (online && !(!cacheDir.empty() && recentlyNotFound(cacheDir, key))) {
     Result found;
     bool transient = false;
     const std::string cleaned = cleanTitleFromFilename(songPath);
     bool have = lookupOnline(tags, cleaned, duration, found, transient);
-    if ((!have || !found.synced) && !transient) {
+    if ((!have || !found.synced) &&
+        !transient) { // nothing, or only untimed lyrics: try harder
       Result better;
       if (lookupSyncedlyrics(tags, cleaned, duration, cacheDir, better,
                              transient)) {
@@ -1214,17 +1092,15 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
       }
     }
     if (have) {
-      synthesizeSync(found, duration);
       saveCache(cacheDir, key, found);
       return found;
     }
+    if (!transient && !cacheDir.empty())
+      writeFileAtomic(cacheDir / "lyrics" / (key + ".none"), "");
   }
 
-  if (!embedded.lines.empty()) {
-    synthesizeSync(embedded, duration);
-    saveCache(cacheDir, key, embedded);
+  if (!embedded.lines.empty())
     return embedded;
-  }
   return std::nullopt;
 }
 
@@ -1234,6 +1110,8 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
 // Auto-generated lyrics: run Whisper (speech recognition) on the song
 // ===========================================================================
 
+// Text that is only music notes / punctuation is a Whisper "hallucination" on
+// instrumental parts, not a lyric.
 static bool isNoiseLine(std::string text) {
   for (const char *symbol : {"\xE2\x99\xAA", "\xE2\x99\xAB", "\xE2\x99\xAC"}) {
     const std::string s = symbol;
@@ -1307,7 +1185,7 @@ Result parseWhisperJson(const std::string &body) {
     const std::string text = sanitize(trimCopy(itText->second));
     if (isNoiseLine(text))
       continue;
-    if (text == prev1 && text == prev2)
+    if (text == prev1 && text == prev2) // stuck in a repetition loop
       continue;
     prev2 = prev1;
     prev1 = text;
@@ -1355,6 +1233,8 @@ std::string lastLineOf(const fs::path &path) {
   const auto data = readFile(path);
   if (!data)
     return "";
+  // Prefer the last line that names an error (the end of a Python traceback);
+  // otherwise the last non-empty line.
   std::string last, lastError;
   for (const std::string &line : splitLines(*data)) {
     const std::string t = trimCopy(line);
@@ -1374,6 +1254,10 @@ std::string lastLineOf(const fs::path &path) {
   return sanitize(pick);
 }
 
+// Runs `whisper` on the song. It is started in its own process group, at low
+// priority (so the music does not stutter), and killed when `cancelled()`
+// says so. Everything the child needs is prepared BEFORE fork(), because after
+// fork() in a multi-threaded program only a few calls are safe.
 GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
                       const std::string &model, const std::string &language,
                       const std::function<bool()> &cancelled,
@@ -1403,7 +1287,7 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
                                    workDir.string(),
                                    "--condition_on_previous_text",
                                    "False"};
-  if (fs::path(bin).filename() == "whisper") {
+  if (fs::path(bin).filename() == "whisper") { // openai-whisper only
     args.push_back("--fp16");
     args.push_back("False");
   }
@@ -1423,7 +1307,7 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
     hasThreads =
         hasThreads || startsWith(envStrings.back(), "OMP_NUM_THREADS=");
   }
-  if (!hasThreads)
+  if (!hasThreads) // leave half of the CPU to the player
     envStrings.push_back(
         "OMP_NUM_THREADS=" +
         std::to_string(std::max(1U, std::thread::hardware_concurrency() / 2)));
@@ -1439,8 +1323,9 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
     return out;
   }
   if (pid == 0) {
+    // ---- child: only async-signal-safe calls from here on ----
     setpgid(0, 0);
-    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    prctl(PR_SET_PDEATHSIG, SIGKILL); // die with the player
     setpriority(PRIO_PROCESS, 0, 15);
     const int devNull = open("/dev/null", O_RDONLY);
     if (devNull >= 0)
@@ -1454,7 +1339,7 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
     _exit(127);
   }
 
-  setpgid(pid, pid);
+  setpgid(pid, pid); // also from the parent: avoids a race with the child
   onPid(pid);
 
   const auto startedAt = std::chrono::steady_clock::now();
@@ -1468,7 +1353,7 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
       break;
     }
     if (r < 0 && errno != EINTR)
-      break;
+      break; // lost track of the child
     if (cancelled())
       killedBecause = "cancelled";
     else if (std::chrono::steady_clock::now() - startedAt >
@@ -1483,9 +1368,13 @@ GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
   }
   onPid(0);
+  // The UI kills the process itself when you cancel or skip the song, so it can
+  // look like a crash from here; that must not be reported as a failure.
   if (killedBecause.empty() && cancelled())
     killedBecause = "cancelled";
 
+  // On a real failure, keep everything Whisper printed (plus the command that
+  // was run) in whisper-error.log next to the lyrics cache.
   auto keepLog = [&]() {
     std::string text = "command:";
     for (const std::string &a : args)
@@ -1561,7 +1450,7 @@ struct Manager::Shared {
 
   mutable std::mutex m;
   std::condition_variable cv;
-  std::uint64_t generation = 0;
+  std::uint64_t generation = 0; // bumped for every new request
   bool hasPending = false;
   bool stop = false;
   bool workerStarted = false;
@@ -1572,17 +1461,32 @@ struct Manager::Shared {
   fs::path cacheDir;
   bool online = true;
 
+  // auto-generated lyrics
   bool generating = false;
-  bool pendingGenerate = false;
+  bool pendingGenerate =
+      false; // start Whisper as soon as the search ends empty
   std::string genModel, genLanguage;
-  std::uint64_t genToken = 0;
-  pid_t childPid = 0;
+  std::uint64_t genToken = 0; // bumped to cancel / invalidate a generation
+  pid_t childPid = 0;         // the running whisper process, 0 if none
   std::chrono::steady_clock::time_point genStart;
   std::string lastError;
+
+  // background preparation (see Manager::setPrefetch)
+  std::condition_variable pfCv;
+  bool pfEnabled = false;
+  bool pfWhisper = false;
+  bool pfStarted = false;
+  std::vector<std::string> pfQueue;
+  std::unordered_set<std::string> pfDone;
+  std::unordered_set<std::string> pfFound;     // songs that have lyrics
+  std::unordered_set<std::string> pfGenerated; // ...made by Whisper
+  pid_t pfPid = 0; // whisper process of the background job, 0 if none
+  std::string pfCurrent;
 };
 
 namespace {
 
+// Stops a running generation. The caller holds the lock.
 void cancelGenerationLocked(Manager::Shared &s) {
   if (!s.generating)
     return;
@@ -1595,6 +1499,7 @@ void cancelGenerationLocked(Manager::Shared &s) {
   }
 }
 
+// Body of the thread that waits for one Whisper run.
 void generatorMain(std::shared_ptr<Manager::Shared> sh, std::string songPath,
                    std::uint64_t token, fs::path cacheDir, std::string model,
                    std::string language) {
@@ -1622,7 +1527,7 @@ void generatorMain(std::shared_ptr<Manager::Shared> sh, std::string songPath,
   }
 
   std::lock_guard<std::mutex> lock(sh->m);
-  if (sh->genToken != token)
+  if (sh->genToken != token) // cancelled or the song changed: drop the answer
     return;
   sh->generating = false;
   sh->childPid = 0;
@@ -1637,6 +1542,7 @@ void generatorMain(std::shared_ptr<Manager::Shared> sh, std::string songPath,
   }
 }
 
+// Starts Whisper for `songPath`. The caller holds the lock.
 void startGenerationLocked(const std::shared_ptr<Manager::Shared> &sh,
                            const std::string &songPath) {
   Manager::Shared &s = *sh;
@@ -1651,6 +1557,160 @@ void startGenerationLocked(const std::shared_ptr<Manager::Shared> &sh,
               s.genLanguage)
       .detach();
 }
+
+} // namespace
+
+namespace {
+
+// Sleeps for up to `seconds`, but wakes early when preparation is switched off.
+void prefetchPause(const std::shared_ptr<Manager::Shared> &sh, double seconds) {
+  std::unique_lock<std::mutex> lock(sh->m);
+  sh->pfCv.wait_for(lock, std::chrono::duration<double>(seconds),
+                    [&] { return sh->stop || !sh->pfEnabled; });
+}
+
+// The background thread of Manager::setPrefetch.
+void prefetchMain(std::shared_ptr<Manager::Shared> sh) {
+  std::unique_lock<std::mutex> lock(sh->m);
+  for (;;) {
+    if (sh->stop)
+      return;
+    // The next song of the queue that is not finished (and is not the song
+    // that is playing: the normal lookup takes care of that one).
+    std::string path;
+    if (sh->pfEnabled) {
+      for (const std::string &song : sh->pfQueue) {
+        if (!sh->pfDone.count(song) && song != sh->currentSong) {
+          path = song;
+          break;
+        }
+      }
+    }
+    if (path.empty()) {
+      sh->pfCurrent.clear();
+      sh->pfCv.wait_for(lock, std::chrono::seconds(2));
+      continue;
+    }
+    sh->pfCurrent = path;
+    const fs::path cacheDir = sh->cacheDir;
+    const bool online = sh->online;
+    const bool wantWhisper = sh->pfWhisper;
+    lock.unlock();
+
+    // 1) every normal source: file next to the song, cache, tags, web
+    const auto started = std::chrono::steady_clock::now();
+    const std::function<bool()> stale = [&]() {
+      std::lock_guard<std::mutex> guard(sh->m);
+      return sh->stop || !sh->pfEnabled;
+    };
+    tlsStale = &stale;
+    std::optional<Result> found;
+    try {
+      found = findLyrics(path, 0.0, cacheDir, online); // length unknown here
+    } catch (...) {
+      found.reset();
+    }
+    tlsStale = nullptr;
+    const bool usedNetwork = std::chrono::steady_clock::now() - started >
+                             std::chrono::milliseconds(150);
+
+    bool finished = true;
+    bool generated = false;
+    bool hasLyrics = found.has_value();
+    bool transient = false;
+
+    if (!found) {
+      const std::string key = hexHash(path);
+      std::error_code ec;
+      const bool sureNotFound = !online || recentlyNotFound(cacheDir, key);
+      const fs::path noGen = cacheDir / "lyrics" / (key + ".nogen");
+      const bool triedBefore = !cacheDir.empty() && fs::exists(noGen, ec);
+      transient = online && !sureNotFound;
+
+      // 2) nothing anywhere: let Whisper listen to the song
+      if (wantWhisper && sureNotFound && !triedBefore &&
+          !generatorCommand().empty()) {
+        lock.lock();
+        while (
+            !sh->stop && sh->pfEnabled && sh->pfWhisper &&
+            (sh->generating || sh->pendingGenerate)) // your own G has priority
+          sh->pfCv.wait_for(lock, std::chrono::seconds(1));
+        const bool proceed = !sh->stop && sh->pfEnabled && sh->pfWhisper &&
+                             path != sh->currentSong;
+        lock.unlock();
+
+        if (!proceed) {
+          finished = false;
+        } else {
+          const std::string model = generatorModel();
+          const char *langEnv = std::getenv("MUZX_WHISPER_LANG");
+          const std::string language = langEnv ? langEnv : "";
+          const fs::path base = cacheDir.empty() ? fs::temp_directory_path(ec)
+                                                 : cacheDir / "lyrics";
+          const fs::path workDir =
+              base / ("gen-pf-" + std::to_string(getpid()));
+          auto cancelled = [&]() {
+            std::lock_guard<std::mutex> guard(sh->m);
+            return sh->stop || !sh->pfEnabled || !sh->pfWhisper ||
+                   sh->generating || sh->pendingGenerate ||
+                   path == sh->currentSong;
+          };
+          auto onPid = [&](pid_t pid) {
+            std::lock_guard<std::mutex> guard(sh->m);
+            sh->pfPid = pid;
+          };
+          GenOutcome outcome =
+              runWhisper(path, workDir, model, language, cancelled, onPid);
+          {
+            std::lock_guard<std::mutex> guard(sh->m);
+            sh->pfPid = 0;
+          }
+          if (outcome.result) {
+            outcome.result->source = "generated (whisper " + model + ")";
+            saveCacheGenerated(cacheDir, key, *outcome.result);
+            generated = true;
+            hasLyrics = true;
+          } else if (cancelled()) {
+            finished = false; // interrupted: try this song again later
+          } else if (!cacheDir.empty()) {
+            writeFileAtomic(noGen,
+                            ""); // it heard nothing: do not retry forever
+          }
+        }
+      }
+    }
+
+    lock.lock();
+    if (finished) {
+      sh->pfDone.insert(path);
+      if (hasLyrics)
+        sh->pfFound.insert(path);
+      if (generated)
+        sh->pfGenerated.insert(path);
+    }
+    lock.unlock();
+
+    if (!finished)
+      prefetchPause(sh, 2.0);
+    else if (transient)
+      prefetchPause(sh, 20.0); // the server is busy or unreachable: slow down
+    else if (usedNetwork)
+      prefetchPause(sh, 1.0); // be gentle with the lyrics server
+    lock.lock();
+  }
+}
+
+} // namespace
+
+namespace {
+
+void workerMain(std::shared_ptr<Manager::Shared> sh);
+
+} // namespace
+
+// The worker only needs Shared, so it is a free function that owns a
+// shared_ptr: it stays valid even if the Manager is destroyed mid-lookup.
+namespace {
 
 void workerMain(std::shared_ptr<Manager::Shared> sh) {
   std::unique_lock<std::mutex> lock(sh->m);
@@ -1680,14 +1740,14 @@ void workerMain(std::shared_ptr<Manager::Shared> sh) {
     tlsStale = nullptr;
     lock.lock();
 
-    if (gen == sh->generation) {
+    if (gen == sh->generation) { // ignore answers for a song we left already
       if (found) {
         sh->result = std::make_shared<const Result>(std::move(*found));
         sh->state = State::Ready;
       } else {
         sh->result.reset();
         sh->state = State::NotFound;
-        if (sh->pendingGenerate)
+        if (sh->pendingGenerate) // G was pressed during the search
           startGenerationLocked(sh, req.path);
       }
       sh->pendingGenerate = false;
@@ -1703,9 +1763,15 @@ Manager::~Manager() {
   {
     std::lock_guard<std::mutex> lock(shared_->m);
     shared_->stop = true;
-    cancelGenerationLocked(*shared_);
+    cancelGenerationLocked(*shared_); // never leave Whisper running behind us
+    if (shared_->pfPid > 0) {
+      kill(-shared_->pfPid, SIGKILL);
+      kill(shared_->pfPid, SIGKILL);
+      shared_->pfPid = 0;
+    }
   }
   shared_->cv.notify_all();
+  shared_->pfCv.notify_all();
 }
 
 void Manager::setCacheDir(const fs::path &dir) {
@@ -1713,6 +1779,7 @@ void Manager::setCacheDir(const fs::path &dir) {
     std::lock_guard<std::mutex> lock(shared_->m);
     shared_->cacheDir = dir;
   }
+  // Work folders of generations that were killed hard (older than an hour).
   std::error_code ec;
   for (fs::directory_iterator it(dir / "lyrics", ec), end; !ec && it != end;
        it.increment(ec)) {
@@ -1741,7 +1808,7 @@ void Manager::request(const std::string &songPath, double durationSeconds) {
   shared_->pendingGenerate = false;
   shared_->lastError.clear();
   shared_->state = State::Loading;
-  shared_->result.reset();
+  shared_->result.reset(); // never show the previous song's lyrics
   shared_->pending = {songPath, durationSeconds};
   shared_->hasPending = true;
 
@@ -1763,7 +1830,7 @@ std::shared_ptr<const Result> Manager::result() const {
 }
 
 bool Manager::generate(const std::string &songPath, double /*duration*/) {
-  const std::string bin = generatorCommand();
+  const std::string bin = generatorCommand(); // file-system access: no lock
   const std::string model = generatorModel();
   const char *langEnv = std::getenv("MUZX_WHISPER_LANG");
   const std::string language = langEnv ? langEnv : "";
@@ -1779,7 +1846,7 @@ bool Manager::generate(const std::string &songPath, double /*duration*/) {
   s.genModel = model;
   s.genLanguage = language;
 
-  if (s.state == State::Loading) {
+  if (s.state == State::Loading) { // still searching: start right after it
     s.pendingGenerate = true;
     s.lastError.clear();
     return true;
@@ -1817,6 +1884,49 @@ double Manager::generatingSeconds() const {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                        shared_->genStart)
       .count();
+}
+
+void Manager::setPrefetch(bool enabled, bool useWhisper) {
+  std::lock_guard<std::mutex> lock(shared_->m);
+  Shared &s = *shared_;
+  s.pfEnabled = enabled;
+  s.pfWhisper = enabled && useWhisper;
+  if (!enabled &&
+      s.pfPid > 0) { // switched off: stop a running background Whisper
+    kill(-s.pfPid, SIGKILL);
+    kill(s.pfPid, SIGKILL);
+  }
+  if (enabled && !s.pfStarted) {
+    s.pfStarted = true;
+    std::thread(prefetchMain, shared_).detach();
+  }
+  s.pfCv.notify_all();
+}
+
+void Manager::setPrefetchQueue(const std::vector<std::string> &songs) {
+  std::lock_guard<std::mutex> lock(shared_->m);
+  shared_->pfQueue = songs;
+  shared_->pfCv.notify_all();
+}
+
+Manager::PrefetchStatus Manager::prefetchStatus() const {
+  std::lock_guard<std::mutex> lock(shared_->m);
+  const Shared &s = *shared_;
+  PrefetchStatus st;
+  st.enabled = s.pfEnabled;
+  st.whisper = s.pfWhisper;
+  st.total = s.pfQueue.size();
+  for (const std::string &song : s.pfQueue) {
+    if (s.pfDone.count(song))
+      ++st.processed;
+    if (s.pfFound.count(song))
+      ++st.found;
+    if (s.pfGenerated.count(song))
+      ++st.generated;
+  }
+  st.whisperRunning = s.pfPid > 0;
+  st.current = s.pfCurrent;
+  return st;
 }
 
 std::string Manager::lastError() const {

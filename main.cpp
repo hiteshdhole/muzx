@@ -30,6 +30,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -193,7 +194,7 @@ void enableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) {
     rawModeEnabled = true;
     if (mouseWanted())
-      std::cout << "\033[?1000h\033[?1006h" << std::flush;
+      std::cout << "\033[?1002h\033[?1006h" << std::flush;
   }
 }
 
@@ -201,7 +202,7 @@ void disableRawMode() {
   if (!rawModeEnabled)
     return;
   if (mouseWanted())
-    std::cout << "\033[?1000l\033[?1006l" << std::flush;
+    std::cout << "\033[?1002l\033[?1006l" << std::flush;
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &originalTerminal);
   rawModeEnabled = false;
 }
@@ -262,12 +263,22 @@ enum ClickAction {
   ClkRepeat,
   ClkSeek,
   ClkListItem,
-  ClkSetting
+  ClkSetting,
+  ClkVolume
 };
 struct ClickRegion {
   int row0, row1, col0, col1, action, arg;
 };
 std::vector<ClickRegion> g_clicks;
+// Dragging the progress bar: remembers where the last seek went to, so every
+// mouse movement only has to move by the difference.
+struct DragState {
+  bool active = false;
+  double target = 0.0; // seconds
+  double duration = 0.0;
+  int col0 = 0, col1 = 0;
+};
+DragState g_drag;
 int g_buttonsRow = 0; // screen row of the Player "Status:" line (0 = none)
 
 void addClick(int row0, int row1, int col0, int col1, int action, int arg = 0) {
@@ -618,6 +629,17 @@ struct AppState {
   std::string settingsNote;  // message shown at the bottom of the tab
   config *cfg = nullptr;
   std::string lyricsSong; // song the lyrics were last requested for
+  // Lyrics timing: seconds the lyrics are shifted LATER (negative = earlier).
+  double lyricShift = 0.0;
+  std::string lyricShiftSong;                // song lyricShift belongs to
+  std::map<std::string, double> lyricShifts; // saved per song
+  fs::path lyricShiftFile;
+  double volumeBeforeMute = 1.0; // 0..1, for click-to-mute
+  // Background lyrics preparation (Settings: "Prepare lyrics")
+  int prefetchMode = 0;             // 0 off, 1 online only, 2 online + Whisper
+  std::vector<std::string> library; // every song under musicRoot
+  fs::path libraryRoot;
+  std::string prefetchKey; // when this changes, the queue is rebuilt
 
   double sessionPlayedSeconds = 0.0;
   double totalPlayedSeconds = 0.0;
@@ -1267,10 +1289,18 @@ void drawPlayer(const AppState &app) {
       return result;
     };
 
-    std::cout << "  Time:    " << formatTime(position) << " / "
-              << formatTime(duration)
-              << "   |   Volume: " << static_cast<int>(app.player.getVolume())
-              << "%\n";
+    const std::string timeText = "  Time:    " + formatTime(position) + " / " +
+                                 formatTime(duration) + "   |   ";
+    const std::string volumeText =
+        "Volume: " + std::to_string(static_cast<int>(app.player.getVolume())) +
+        "%";
+    {
+      const int timeRow = CoutCapture::rowsSoFar() + 1;
+      addClick(timeRow, timeRow, static_cast<int>(timeText.size()) + 1,
+               static_cast<int>(timeText.size() + volumeText.size()), ClkVolume,
+               0);
+    }
+    std::cout << timeText << volumeText << "\n";
     // "ON " is padded to the width of "OFF" so the "|" does not jump.
     std::cout << "  Shuffle: "
               << (app.shuffle ? std::string(kGreenBold) + "ON "
@@ -1411,10 +1441,13 @@ void drawKeybindings() {
   row("G", "Generate lyrics with Whisper (G again cancels)");
   row("A", "Auto-generate lyrics when none exist");
   row("T", "Show the lyrics on the Arduino LCD (on / off)");
+  row("[  /  ]  /  \\",
+      "Lyrics earlier / later by 0.5 s (saved per song) / reset");
   row("+ / -", "Adjust volume");
   row("x", "Stop playback");
   row("Mouse",
-      "Click tabs, buttons, progress bar, list rows; wheel = scroll / volume");
+      "Click tabs, buttons, list rows; drag the progress bar to seek;");
+  row("", "click the volume number to mute; wheel = scroll / volume");
 
   std::cout << "\n";
   section("NAVIGATION & TABS");
@@ -1463,6 +1496,57 @@ void splitSongName(const std::string &path, std::string &title,
     parts.erase(parts.begin());
   title = parts.front();
   artist = parts.size() > 1 ? parts.back() : "";
+}
+
+// ---------------------------------------------------------------------------
+// Lyrics timing offset, saved per song: ~/.config/muzx/lyrics-offsets.txt
+// (one line per song:  <path> TAB <seconds>)
+// ---------------------------------------------------------------------------
+void loadLyricShifts(AppState &app) {
+  std::ifstream in(app.lyricShiftFile);
+  std::string line;
+  while (std::getline(in, line)) {
+    const std::size_t tab = line.rfind('\t');
+    if (tab == std::string::npos)
+      continue;
+    try {
+      const double v = std::stod(line.substr(tab + 1));
+      if (std::isfinite(v) && v != 0.0)
+        app.lyricShifts[line.substr(0, tab)] = std::clamp(v, -60.0, 60.0);
+    } catch (...) {
+    }
+  }
+}
+
+void saveLyricShifts(const AppState &app) {
+  if (app.lyricShiftFile.empty())
+    return;
+  std::ofstream out(app.lyricShiftFile, std::ios::trunc);
+  for (const auto &entry : app.lyricShifts)
+    out << entry.first << '\t' << entry.second << '\n';
+}
+
+// Picks up the saved shift when the song changes.
+void syncLyricShift(AppState &app) {
+  if (app.currentSong == app.lyricShiftSong)
+    return;
+  app.lyricShiftSong = app.currentSong;
+  const auto it = app.lyricShifts.find(app.currentSong);
+  app.lyricShift = it == app.lyricShifts.end() ? 0.0 : it->second;
+}
+
+// delta = 0 resets. Keys: [ earlier, ] later, \ reset.
+void adjustLyricShift(AppState &app, double delta) {
+  if (!app.hasCurrentSong)
+    return;
+  syncLyricShift(app);
+  app.lyricShift =
+      delta == 0.0 ? 0.0 : std::clamp(app.lyricShift + delta, -60.0, 60.0);
+  if (std::fabs(app.lyricShift) < 0.01)
+    app.lyricShifts.erase(app.currentSong);
+  else
+    app.lyricShifts[app.currentSong] = app.lyricShift;
+  saveLyricShifts(app);
 }
 
 // The player only has "louder" and "quieter" steps, so walk towards the target.
@@ -1658,7 +1742,8 @@ enum SettingItem {
   SetLyrics,
   SetAutoGen,
   SetModel,
-  SetLang, // lyrics
+  SetLang,
+  SetPrefetch, // lyrics
   SetLcd,
   SetLcdKana, // LCD
   SetArt,
@@ -1727,6 +1812,7 @@ std::string settingsToText(const AppState &app) {
       << "auto_generate=" << (app.lyricsAutoGen ? 1 : 0) << "\n"
       << "whisper_model=" << app.whisperModel << "\n"
       << "whisper_lang=" << app.whisperLang << "\n"
+      << "prefetch=" << app.prefetchMode << "\n"
       << "lcd=" << (app.lcd.enabled() ? 1 : 0) << "\n"
       << "lcd_kana=" << (app.lcd.kana() ? 1 : 0) << "\n"
       << "album_art=" << (app.showAlbumArt ? 1 : 0) << "\n"
@@ -1802,6 +1888,8 @@ void loadSettings(AppState &app) {
     app.whisperModel = values["whisper_model"];
   if (values.count("whisper_lang"))
     app.whisperLang = values["whisper_lang"];
+  if (values.count("prefetch"))
+    app.prefetchMode = std::clamp(std::atoi(values["prefetch"].c_str()), 0, 2);
   if (values.count("theme"))
     for (int i = 0; i < kThemeCount; ++i)
       if (values["theme"] == kThemes[i].name)
@@ -1846,6 +1934,14 @@ void changeSetting(AppState &app, int item, int dir) {
     applyWhisperEnv(app, true);
     break;
   }
+  case SetPrefetch:
+    app.prefetchMode = cycleIndex(app.prefetchMode, dir, 3);
+    app.lyricsMgr.setPrefetch(app.prefetchMode >= 1, app.prefetchMode == 2);
+    app.whisperAvailable = !lyrics::generatorCommand().empty();
+    if (app.prefetchMode == 2 && !app.whisperAvailable)
+      app.settingsNote =
+          "Whisper is not installed: only the online lookup will work.";
+    break;
   case SetLcd:
     app.lcd.toggle();
     break;
@@ -1951,6 +2047,19 @@ std::string settingValue(const AppState &app, int item) {
     return app.whisperModel.empty() ? "default" : app.whisperModel;
   case SetLang:
     return app.whisperLang.empty() ? "automatic" : app.whisperLang;
+  case SetPrefetch: {
+    if (app.prefetchMode == 0)
+      return "Off";
+    const lyrics::Manager::PrefetchStatus st = app.lyricsMgr.prefetchStatus();
+    std::string text =
+        app.prefetchMode == 1 ? "Online only" : "Online + Whisper";
+    text += "   (" + std::to_string(st.processed) + "/" +
+            std::to_string(st.total) + " checked, " + std::to_string(st.found) +
+            " ready";
+    if (st.whisperRunning)
+      text += ", generating...";
+    return text + ")";
+  }
   case SetLcd:
     return app.lcd.enabled()
                ? (app.lcd.connected() ? "On (connected)"
@@ -1994,6 +2103,7 @@ void drawSettings(const AppState &app) {
                                                     "Auto-generate",
                                                     "Whisper model",
                                                     "Whisper language",
+                                                    "Prepare lyrics",
                                                     "LCD display",
                                                     "LCD Japanese",
                                                     "Album art",
@@ -2085,6 +2195,12 @@ void drawSettings(const AppState &app) {
 
 constexpr int kLyricsMinCols = 101;         // narrower terminals: no panel
 constexpr double kLyricsLeadSeconds = 0.25; // highlight a line a bit early
+
+// Where we are in the song, as far as the lyrics are concerned.
+double lyricsPosition(const AppState &app) {
+  return static_cast<double>(app.player.getPlayingOffset().asSeconds()) +
+         kLyricsLeadSeconds - app.lyricShift;
+}
 
 int terminalCols() {
   winsize w{};
@@ -2254,6 +2370,38 @@ void updateLyricsRequest(AppState &app) {
   }
 }
 
+// Tells the lyrics module which songs to prepare in the background: the rest
+// of the playlist first (in play order), then everything else in the library.
+void updatePrefetchQueue(AppState &app) {
+  if (app.prefetchMode == 0)
+    return;
+  const std::string key =
+      std::to_string(app.prefetchMode) + "|" + app.currentSong + "|" +
+      std::to_string(app.playlist.size()) + "|" +
+      std::to_string(app.playlistIndex) + "|" + app.musicRoot.string();
+  if (key == app.prefetchKey)
+    return;
+  app.prefetchKey = key;
+
+  if (app.libraryRoot != app.musicRoot || app.library.empty()) {
+    app.libraryRoot = app.musicRoot;
+    app.library = audioFilesIn(app.musicRoot, true);
+  }
+  std::vector<std::string> queue;
+  std::unordered_set<std::string> seen;
+  auto add = [&](const std::string &song) {
+    if (!song.empty() && song != app.currentSong && seen.insert(song).second)
+      queue.push_back(song);
+  };
+  const std::size_t n = app.playlist.size();
+  if (n > 0)
+    for (std::size_t i = 1; i <= n; ++i)
+      add(app.playlist[(app.playlistIndex + i) % n]);
+  for (const std::string &song : app.library)
+    add(song);
+  app.lyricsMgr.setPrefetchQueue(queue);
+}
+
 // Sends the line being sung (or the song name) to the Arduino LCD.
 void updateLcd(AppState &app) {
   if (!app.lcd.enabled())
@@ -2266,9 +2414,7 @@ void updateLcd(AppState &app) {
   const std::shared_ptr<const lyrics::Result> result = app.lyricsMgr.result();
   if (app.lyricsMgr.state() == lyrics::State::Ready && result &&
       result->synced && !result->lines.empty()) {
-    const double position =
-        static_cast<double>(app.player.getPlayingOffset().asSeconds()) +
-        kLyricsLeadSeconds;
+    const double position = lyricsPosition(app);
     const auto &lines = result->lines;
     const auto it = std::upper_bound(
         lines.begin(), lines.end(), position,
@@ -2361,6 +2507,11 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
   std::string detail;
   if (result)
     detail = "  " + result->source + (result->synced ? "" : "  (not synced)");
+  if (result && std::fabs(app.lyricShift) >= 0.01) {
+    char shift[24];
+    std::snprintf(shift, sizeof(shift), "  sync %+.1fs", app.lyricShift);
+    detail += shift;
+  }
   const std::string autoState = app.lyricsAutoGen ? "ON" : "OFF";
   const std::string hints[] = {"   L move/hide  |  G generate  |  A auto (" +
                                    autoState + ")",
@@ -2430,9 +2581,7 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
   long startRow = 0;
 
   if (result->synced) {
-    const double position =
-        static_cast<double>(app.player.getPlayingOffset().asSeconds()) +
-        kLyricsLeadSeconds;
+    const double position = lyricsPosition(app);
     // The line being sung = the last one whose time has already passed.
     const auto it = std::upper_bound(
         lines.begin(), lines.end(), position,
@@ -2703,7 +2852,28 @@ KeyResult handleMouse(AppState &app, const fs::path &queueFile) {
     }
     return KeyResult::Handled;
   }
-  if (!m.press || m.button != 0) // only a plain left click
+  if (m.button == 32) { // the mouse moved with the left button held down
+    if (g_drag.active && app.hasCurrentSong) {
+      const double fraction = static_cast<double>(m.x - g_drag.col0) /
+                              std::max(1, g_drag.col1 - g_drag.col0);
+      const double target = std::clamp(fraction, 0.0, 1.0) * g_drag.duration;
+      const double delta = target - g_drag.target;
+      if (std::fabs(delta) >= 0.05) {
+        if (delta > 0)
+          app.player.seekForward(static_cast<float>(delta));
+        else
+          app.player.seekBackward(static_cast<float>(-delta));
+        g_drag.target = target;
+      }
+    }
+    return KeyResult::Handled;
+  }
+  if (!m.press) { // button released: the drag is over
+    g_drag.active = false;
+    return KeyResult::Handled;
+  }
+  g_drag.active = false;
+  if (m.button != 0) // only a plain left click
     return KeyResult::Handled;
 
   for (auto it = g_clicks.rbegin(); it != g_clicks.rend(); ++it) {
@@ -2739,12 +2909,26 @@ KeyResult handleMouse(AppState &app, const fs::path &queueFile) {
       const float fraction =
           static_cast<float>(m.x - it->col0) /
           static_cast<float>(std::max(1, it->col1 - it->col0));
-      const float delta =
-          std::clamp(fraction, 0.0F, 1.0F) * duration - position;
+      const float target = std::clamp(fraction, 0.0F, 1.0F) * duration;
+      const float delta = target - position;
       if (delta >= 0.0F)
         app.player.seekForward(delta);
       else
         app.player.seekBackward(-delta);
+      // Keep the button held and move: the bar follows the mouse.
+      g_drag = {true, static_cast<double>(target),
+                static_cast<double>(duration), it->col0, it->col1};
+      break;
+    }
+    case ClkVolume: {
+      const double now = app.player.getVolume() / 100.0;
+      if (now > 0.02) {
+        app.volumeBeforeMute = now;
+        setPlayerVolume(app, 0.0);
+      } else {
+        setPlayerVolume(app, app.volumeBeforeMute > 0.02 ? app.volumeBeforeMute
+                                                         : 0.5);
+      }
       break;
     }
     case ClkListItem: {
@@ -2878,6 +3062,11 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
       app.whisperAvailable = !lyrics::generatorCommand().empty();
       app.lyricsMgr.generate(app.currentSong, 0.0);
     }
+    return KeyResult::Handled;
+  }
+  if (key == '[' || key == ']' || key == '\\') {
+    // Lyrics timing for this song: [ earlier, ] later, \ reset
+    adjustLyricShift(app, key == '[' ? -0.5 : key == ']' ? 0.5 : 0.0);
     return KeyResult::Handled;
   }
   if (key == 'T') {
@@ -3083,7 +3272,10 @@ int run() {
     app.lyricsMgr.setOnlineEnabled(false);
 
   app.settingsFile = configDirectory / "settings.conf";
+  app.lyricShiftFile = configDirectory / "lyrics-offsets.txt";
+  loadLyricShifts(app);
   loadSettings(app);
+  app.lyricsMgr.setPrefetch(app.prefetchMode >= 1, app.prefetchMode == 2);
   applyTheme(app.theme);
   applyWhisperEnv(app, false);
   if (app.fontSize > 0)
@@ -3121,6 +3313,8 @@ int run() {
     }
 
     updateLyricsRequest(app); // start a lyrics lookup when the song changed
+    syncLyricShift(app);
+    updatePrefetchQueue(app);
     updateLcd(app);
     notifySongChange(app);
     if (serviceMpris(app))

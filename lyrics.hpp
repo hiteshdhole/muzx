@@ -86,6 +86,25 @@ public:
   double generatingSeconds() const; // time since generation started, else 0
   std::string lastError() const;    // why the last generation / start failed
 
+  // ---- background preparation ----------------------------------------------
+  // Looks up (and, with `useWhisper`, generates) lyrics for the songs in the
+  // queue, one at a time, while you listen to something else. Whisper only
+  // runs for songs that no source has, at low priority, and it stops as soon
+  // as you press G yourself. Everything is cached, so a song is done once.
+  struct PrefetchStatus {
+    bool enabled = false;
+    bool whisper = false;
+    std::size_t processed = 0; // songs of the queue that are finished
+    std::size_t total = 0;     // songs in the queue
+    std::size_t found = 0;     // finished songs that have lyrics
+    std::size_t generated = 0; // of those, made by Whisper in this session
+    bool whisperRunning = false;
+    std::string current; // the song being worked on
+  };
+  void setPrefetch(bool enabled, bool useWhisper);
+  void setPrefetchQueue(const std::vector<std::string> &songs); // in this order
+  PrefetchStatus prefetchStatus() const;
+
   struct Shared; // internal; public only so the worker thread can name it
 
 private:
