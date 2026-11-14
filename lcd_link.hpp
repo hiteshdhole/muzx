@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -10,7 +11,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -829,10 +832,16 @@ inline std::string toLcd(const std::string &rawIn, bool kanaMode) {
 
 class LcdLink {
 public:
-  ~LcdLink() { close_port(); }
+  ~LcdLink() {
+    close_port();
+    if (daemonFd_ >= 0)
+      ::close(daemonFd_);
+  }
 
   bool enabled() const { return enabled_; }
-  bool connected() const { return fd_ >= 0; }
+  // True when the screen is reachable: directly, or through the muzxlcd
+  // program.
+  bool connected() const { return fd_ >= 0 || viaDaemon_; }
   void setEnabled(bool on) {
     if (on != enabled_)
       toggle();
@@ -858,6 +867,14 @@ public:
     if (!enabled_)
       return;
     const auto now = std::chrono::steady_clock::now();
+
+    // If the muzxlcd program is running it owns the screen: hand the line to
+    // it (it also switches between lyrics / clock / PC status ...).
+    if (viaDaemon_ || now >= nextDaemonTry_) {
+      if (sendToDaemon(text, now))
+        return;
+      nextDaemonTry_ = now + std::chrono::milliseconds(1000);
+    }
 
     if (fd_ >= 0 && now >= nextCheck_) {
       nextCheck_ = now + std::chrono::milliseconds(250);
@@ -912,6 +929,52 @@ public:
   }
 
 private:
+  static std::string daemonSocketPath() {
+    if (const char *o = std::getenv("MUZXLCD_SOCKET"); o && *o)
+      return o;
+    const char *rt = std::getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt)
+      return std::string(rt) + "/muzxlcd.sock";
+    return "/tmp/muzxlcd-" + std::to_string(getuid()) + ".sock";
+  }
+
+  // true = the line went to muzxlcd (or was already sent recently).
+  bool sendToDaemon(const std::string &text,
+                    std::chrono::steady_clock::time_point now) {
+    if (viaDaemon_ && text == daemonText_ &&
+        now - daemonSentAt_ < std::chrono::milliseconds(1500))
+      return true;
+    if (daemonFd_ < 0)
+      daemonFd_ =
+          ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (daemonFd_ < 0)
+      return false;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    const std::string path = daemonSocketPath();
+    if (path.size() >= sizeof(addr.sun_path))
+      return false;
+    std::copy(path.begin(), path.end(), addr.sun_path);
+    std::string msg = "lyric " + text;
+    for (char &c : msg)
+      if (c == '\n' || c == '\r')
+        c = ' ';
+    const ssize_t n =
+        ::sendto(daemonFd_, msg.data(), msg.size(), MSG_DONTWAIT,
+                 reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    if (n < 0 && errno != EAGAIN) {
+      viaDaemon_ = false;
+      return false;
+    }
+    if (!viaDaemon_) { // switch over: release the serial port for muzxlcd
+      close_port();
+      viaDaemon_ = true;
+    }
+    daemonText_ = text;
+    daemonSentAt_ = now;
+    return true;
+  }
+
   bool open_port() {
     const char *env = std::getenv("MUZX_LCD_PORT");
     const std::string candidates[] = {
@@ -956,6 +1019,10 @@ private:
 
   bool kanaMode_ = std::getenv("MUZX_LCD_KANA") != nullptr;
   bool enabled_ = true;
+  bool viaDaemon_ = false;
+  int daemonFd_ = -1;
+  std::string daemonText_;
+  std::chrono::steady_clock::time_point nextDaemonTry_{}, daemonSentAt_{};
   int fd_ = -1;
   std::string port_;
   std::string last_;
