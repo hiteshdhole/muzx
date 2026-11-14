@@ -1106,98 +1106,6 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
 
 } // namespace
 
-// ===========================================================================
-// Auto-generated lyrics: run Whisper (speech recognition) on the song
-// ===========================================================================
-
-// Text that is only music notes / punctuation is a Whisper "hallucination" on
-// instrumental parts, not a lyric.
-static bool isNoiseLine(std::string text) {
-  for (const char *symbol : {"\xE2\x99\xAA", "\xE2\x99\xAB", "\xE2\x99\xAC"}) {
-    const std::string s = symbol;
-    for (auto pos = text.find(s); pos != std::string::npos; pos = text.find(s))
-      text.erase(pos, s.size());
-  }
-  for (unsigned char c : text) {
-    if (std::isalnum(c) || c >= 0x80)
-      return false;
-  }
-  return true;
-}
-
-Result parseWhisperJson(const std::string &body) {
-  Result result;
-  const char *p = body.data();
-  const char *e = p + body.size();
-  skipWs(p, e);
-  if (p >= e || *p != '{')
-    return result;
-  ++p;
-
-  std::vector<JsonObject> segments;
-  for (;;) {
-    skipWs(p, e);
-    if (p >= e || *p == '}')
-      break;
-    if (*p == ',') {
-      ++p;
-      continue;
-    }
-    std::string key;
-    if (!parseJsonString(p, e, key))
-      break;
-    skipWs(p, e);
-    if (p >= e || *p != ':')
-      break;
-    ++p;
-    skipWs(p, e);
-    if (key == "segments" && p < e && *p == '[') {
-      ++p;
-      for (;;) {
-        skipWs(p, e);
-        if (p >= e)
-          break;
-        if (*p == ']') {
-          ++p;
-          break;
-        }
-        if (*p == ',') {
-          ++p;
-          continue;
-        }
-        JsonObject obj;
-        if (*p == '{' && parseJsonObject(p, e, obj))
-          segments.push_back(std::move(obj));
-        else
-          break;
-      }
-    } else if (!skipJsonValue(p, e)) {
-      break;
-    }
-  }
-
-  std::string prev1, prev2;
-  for (const JsonObject &seg : segments) {
-    const auto itText = seg.str.find("text");
-    const auto itStart = seg.num.find("start");
-    if (itText == seg.str.end() || itStart == seg.num.end())
-      continue;
-    const std::string text = sanitize(trimCopy(itText->second));
-    if (isNoiseLine(text))
-      continue;
-    if (text == prev1 && text == prev2) // stuck in a repetition loop
-      continue;
-    prev2 = prev1;
-    prev1 = text;
-    result.lines.push_back({std::max(0.0, itStart->second), text});
-  }
-  std::stable_sort(
-      result.lines.begin(), result.lines.end(),
-      [](const Line &a, const Line &b) { return a.time < b.time; });
-  result.synced = !result.lines.empty();
-  return result;
-}
-
 namespace {
 
 std::string findExecutable(const std::string &name) {
@@ -1224,220 +1132,7 @@ std::string findExecutable(const std::string &name) {
   return "";
 }
 
-struct GenOutcome {
-  std::optional<Result> result;
-  std::string error;
-};
-
-std::string lastLineOf(const fs::path &path) {
-  const auto data = readFile(path);
-  if (!data)
-    return "";
-  // Prefer the last line that names an error (the end of a Python traceback);
-  // otherwise the last non-empty line.
-  std::string last, lastError;
-  for (const std::string &line : splitLines(*data)) {
-    const std::string t = trimCopy(line);
-    if (t.empty())
-      continue;
-    last = t;
-    const std::string lower = lowerCopy(t);
-    if (lower.find("error") != std::string::npos ||
-        lower.find("exception") != std::string::npos ||
-        lower.find("no such file") != std::string::npos ||
-        lower.find("not found") != std::string::npos)
-      lastError = t;
-  }
-  std::string pick = lastError.empty() ? last : lastError;
-  if (pick.size() > 100)
-    pick.resize(100);
-  return sanitize(pick);
-}
-
-// Runs `whisper` on the song. It is started in its own process group, at low
-// priority (so the music does not stutter), and killed when `cancelled()`
-// says so. Everything the child needs is prepared BEFORE fork(), because after
-// fork() in a multi-threaded program only a few calls are safe.
-GenOutcome runWhisper(const std::string &songPath, const fs::path &workDir,
-                      const std::string &model, const std::string &language,
-                      const std::function<bool()> &cancelled,
-                      const std::function<void(pid_t)> &onPid) {
-  GenOutcome out;
-  const std::string bin = generatorCommand();
-  if (bin.empty()) {
-    out.error = "Whisper is not installed";
-    return out;
-  }
-
-  std::error_code ec;
-  fs::create_directories(workDir, ec);
-  if (ec) {
-    out.error = "cannot create a work folder";
-    return out;
-  }
-  const std::string logPath = (workDir / "log.txt").string();
-
-  std::vector<std::string> args = {bin,
-                                   songPath,
-                                   "--model",
-                                   model,
-                                   "--output_format",
-                                   "json",
-                                   "--output_dir",
-                                   workDir.string(),
-                                   "--condition_on_previous_text",
-                                   "False"};
-  if (fs::path(bin).filename() == "whisper") { // openai-whisper only
-    args.push_back("--fp16");
-    args.push_back("False");
-  }
-  if (!language.empty()) {
-    args.push_back("--language");
-    args.push_back(language);
-  }
-  std::vector<char *> argv;
-  for (std::string &a : args)
-    argv.push_back(a.data());
-  argv.push_back(nullptr);
-
-  std::vector<std::string> envStrings;
-  bool hasThreads = false;
-  for (char **env = environ; env && *env; ++env) {
-    envStrings.emplace_back(*env);
-    hasThreads =
-        hasThreads || startsWith(envStrings.back(), "OMP_NUM_THREADS=");
-  }
-  if (!hasThreads) // leave half of the CPU to the player
-    envStrings.push_back(
-        "OMP_NUM_THREADS=" +
-        std::to_string(std::max(1U, std::thread::hardware_concurrency() / 2)));
-  std::vector<char *> envp;
-  for (std::string &s : envStrings)
-    envp.push_back(s.data());
-  envp.push_back(nullptr);
-
-  const pid_t pid = fork();
-  if (pid < 0) {
-    out.error = "cannot start Whisper";
-    fs::remove_all(workDir, ec);
-    return out;
-  }
-  if (pid == 0) {
-    // ---- child: only async-signal-safe calls from here on ----
-    setpgid(0, 0);
-    prctl(PR_SET_PDEATHSIG, SIGKILL); // die with the player
-    setpriority(PRIO_PROCESS, 0, 15);
-    const int devNull = open("/dev/null", O_RDONLY);
-    if (devNull >= 0)
-      dup2(devNull, STDIN_FILENO);
-    const int log = open(logPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (log >= 0) {
-      dup2(log, STDOUT_FILENO);
-      dup2(log, STDERR_FILENO);
-    }
-    execve(argv[0], argv.data(), envp.data());
-    _exit(127);
-  }
-
-  setpgid(pid, pid); // also from the parent: avoids a race with the child
-  onPid(pid);
-
-  const auto startedAt = std::chrono::steady_clock::now();
-  int status = 0;
-  bool exited = false;
-  std::string killedBecause;
-  for (;;) {
-    const pid_t r = waitpid(pid, &status, WNOHANG);
-    if (r == pid) {
-      exited = true;
-      break;
-    }
-    if (r < 0 && errno != EINTR)
-      break; // lost track of the child
-    if (cancelled())
-      killedBecause = "cancelled";
-    else if (std::chrono::steady_clock::now() - startedAt >
-             std::chrono::minutes(30))
-      killedBecause = "timed out after 30 minutes";
-    if (!killedBecause.empty()) {
-      kill(-pid, SIGKILL);
-      kill(pid, SIGKILL);
-      waitpid(pid, &status, 0);
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-  }
-  onPid(0);
-  // The UI kills the process itself when you cancel or skip the song, so it can
-  // look like a crash from here; that must not be reported as a failure.
-  if (killedBecause.empty() && cancelled())
-    killedBecause = "cancelled";
-
-  // On a real failure, keep everything Whisper printed (plus the command that
-  // was run) in whisper-error.log next to the lyrics cache.
-  auto keepLog = [&]() {
-    std::string text = "command:";
-    for (const std::string &a : args)
-      text += " '" + a + "'";
-    text += "\n\n";
-    if (const auto log = readFile(logPath))
-      text += *log;
-    writeFileAtomic(workDir.parent_path() / "whisper-error.log", text);
-  };
-
-  if (!killedBecause.empty()) {
-    out.error = killedBecause;
-  } else if (!exited || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    const std::string reason = lastLineOf(logPath);
-    out.error = "Whisper failed" + (reason.empty() ? "" : ": " + reason);
-    keepLog();
-  } else {
-    for (fs::directory_iterator it(workDir, ec), end; !ec && it != end;
-         it.increment(ec)) {
-      if (it->path().extension() != ".json")
-        continue;
-      if (const auto data = readFile(it->path())) {
-        Result r = parseWhisperJson(*data);
-        if (!r.lines.empty()) {
-          out.result = std::move(r);
-          break;
-        }
-      }
-    }
-    if (!out.result) {
-      out.error = "no lyrics detected (instrumental?)";
-      keepLog();
-    }
-  }
-  fs::remove_all(workDir, ec);
-  return out;
-}
-
-void saveCacheGenerated(const fs::path &cacheDir, const std::string &key,
-                        const Result &r) {
-  if (cacheDir.empty())
-    return;
-  writeFileAtomic(cacheDir / "lyrics" / (key + ".gen.lrc"), toLrc(r));
-}
-
 } // namespace
-
-std::string generatorCommand() {
-  if (const char *custom = std::getenv("MUZX_WHISPER"); custom && *custom)
-    return findExecutable(custom);
-  for (const char *name : {"whisper", "whisper-ctranslate2"}) {
-    const std::string found = findExecutable(name);
-    if (!found.empty())
-      return found;
-  }
-  return "";
-}
-
-std::string generatorModel() {
-  if (const char *model = std::getenv("MUZX_WHISPER_MODEL"); model && *model)
-    return model;
-  return "small";
-}
 
 // ===========================================================================
 // Manager: one background thread, always working on the newest request
@@ -1461,104 +1156,15 @@ struct Manager::Shared {
   fs::path cacheDir;
   bool online = true;
 
-  // auto-generated lyrics
-  bool generating = false;
-  bool pendingGenerate =
-      false; // start Whisper as soon as the search ends empty
-  std::string genModel, genLanguage;
-  std::uint64_t genToken = 0; // bumped to cancel / invalidate a generation
-  pid_t childPid = 0;         // the running whisper process, 0 if none
-  std::chrono::steady_clock::time_point genStart;
-  std::string lastError;
-
   // background preparation (see Manager::setPrefetch)
   std::condition_variable pfCv;
   bool pfEnabled = false;
-  bool pfWhisper = false;
   bool pfStarted = false;
   std::vector<std::string> pfQueue;
   std::unordered_set<std::string> pfDone;
-  std::unordered_set<std::string> pfFound;     // songs that have lyrics
-  std::unordered_set<std::string> pfGenerated; // ...made by Whisper
-  pid_t pfPid = 0; // whisper process of the background job, 0 if none
+  std::unordered_set<std::string> pfFound; // songs that have lyrics
   std::string pfCurrent;
 };
-
-namespace {
-
-// Stops a running generation. The caller holds the lock.
-void cancelGenerationLocked(Manager::Shared &s) {
-  if (!s.generating)
-    return;
-  ++s.genToken;
-  s.generating = false;
-  if (s.childPid > 0) {
-    kill(-s.childPid, SIGKILL);
-    kill(s.childPid, SIGKILL);
-    s.childPid = 0;
-  }
-}
-
-// Body of the thread that waits for one Whisper run.
-void generatorMain(std::shared_ptr<Manager::Shared> sh, std::string songPath,
-                   std::uint64_t token, fs::path cacheDir, std::string model,
-                   std::string language) {
-  std::error_code ec;
-  const fs::path base =
-      cacheDir.empty() ? fs::temp_directory_path(ec) : cacheDir / "lyrics";
-  const fs::path workDir =
-      base / ("gen-" + std::to_string(getpid()) + "-" + std::to_string(token));
-
-  auto cancelled = [&]() {
-    std::lock_guard<std::mutex> lock(sh->m);
-    return sh->stop || sh->genToken != token;
-  };
-  auto onPid = [&](pid_t pid) {
-    std::lock_guard<std::mutex> lock(sh->m);
-    if (sh->genToken == token)
-      sh->childPid = pid;
-  };
-
-  GenOutcome outcome =
-      runWhisper(songPath, workDir, model, language, cancelled, onPid);
-  if (outcome.result) {
-    outcome.result->source = "generated (whisper " + model + ")";
-    saveCacheGenerated(cacheDir, hexHash(songPath), *outcome.result);
-  }
-
-  std::lock_guard<std::mutex> lock(sh->m);
-  if (sh->genToken != token) // cancelled or the song changed: drop the answer
-    return;
-  sh->generating = false;
-  sh->childPid = 0;
-  if (outcome.result) {
-    sh->result = std::make_shared<const Result>(std::move(*outcome.result));
-    sh->state = State::Ready;
-    sh->lastError.clear();
-  } else {
-    sh->result.reset();
-    sh->state = State::NotFound;
-    sh->lastError = outcome.error;
-  }
-}
-
-// Starts Whisper for `songPath`. The caller holds the lock.
-void startGenerationLocked(const std::shared_ptr<Manager::Shared> &sh,
-                           const std::string &songPath) {
-  Manager::Shared &s = *sh;
-  s.generating = true;
-  s.pendingGenerate = false;
-  ++s.genToken;
-  s.state = State::Generating;
-  s.result.reset();
-  s.genStart = std::chrono::steady_clock::now();
-  s.lastError.clear();
-  std::thread(generatorMain, sh, songPath, s.genToken, s.cacheDir, s.genModel,
-              s.genLanguage)
-      .detach();
-}
-
-} // namespace
 
 namespace {
 
@@ -1594,10 +1200,9 @@ void prefetchMain(std::shared_ptr<Manager::Shared> sh) {
     sh->pfCurrent = path;
     const fs::path cacheDir = sh->cacheDir;
     const bool online = sh->online;
-    const bool wantWhisper = sh->pfWhisper;
     lock.unlock();
 
-    // 1) every normal source: file next to the song, cache, tags, web
+    // Every normal source: file next to the song, cache, tags, web
     const auto started = std::chrono::steady_clock::now();
     const std::function<bool()> stale = [&]() {
       std::lock_guard<std::mutex> guard(sh->m);
@@ -1614,83 +1219,24 @@ void prefetchMain(std::shared_ptr<Manager::Shared> sh) {
     const bool usedNetwork = std::chrono::steady_clock::now() - started >
                              std::chrono::milliseconds(150);
 
-    bool finished = true;
-    bool generated = false;
-    bool hasLyrics = found.has_value();
+    // Nothing found and not known to be missing: the server was busy or
+    // unreachable, so this song is tried again later.
     bool transient = false;
-
-    if (!found) {
-      const std::string key = hexHash(path);
-      std::error_code ec;
-      const bool sureNotFound = !online || recentlyNotFound(cacheDir, key);
-      const fs::path noGen = cacheDir / "lyrics" / (key + ".nogen");
-      const bool triedBefore = !cacheDir.empty() && fs::exists(noGen, ec);
-      transient = online && !sureNotFound;
-
-      // 2) nothing anywhere: let Whisper listen to the song
-      if (wantWhisper && sureNotFound && !triedBefore &&
-          !generatorCommand().empty()) {
-        lock.lock();
-        while (
-            !sh->stop && sh->pfEnabled && sh->pfWhisper &&
-            (sh->generating || sh->pendingGenerate)) // your own G has priority
-          sh->pfCv.wait_for(lock, std::chrono::seconds(1));
-        const bool proceed = !sh->stop && sh->pfEnabled && sh->pfWhisper &&
-                             path != sh->currentSong;
-        lock.unlock();
-
-        if (!proceed) {
-          finished = false;
-        } else {
-          const std::string model = generatorModel();
-          const char *langEnv = std::getenv("MUZX_WHISPER_LANG");
-          const std::string language = langEnv ? langEnv : "";
-          const fs::path base = cacheDir.empty() ? fs::temp_directory_path(ec)
-                                                 : cacheDir / "lyrics";
-          const fs::path workDir =
-              base / ("gen-pf-" + std::to_string(getpid()));
-          auto cancelled = [&]() {
-            std::lock_guard<std::mutex> guard(sh->m);
-            return sh->stop || !sh->pfEnabled || !sh->pfWhisper ||
-                   sh->generating || sh->pendingGenerate ||
-                   path == sh->currentSong;
-          };
-          auto onPid = [&](pid_t pid) {
-            std::lock_guard<std::mutex> guard(sh->m);
-            sh->pfPid = pid;
-          };
-          GenOutcome outcome =
-              runWhisper(path, workDir, model, language, cancelled, onPid);
-          {
-            std::lock_guard<std::mutex> guard(sh->m);
-            sh->pfPid = 0;
-          }
-          if (outcome.result) {
-            outcome.result->source = "generated (whisper " + model + ")";
-            saveCacheGenerated(cacheDir, key, *outcome.result);
-            generated = true;
-            hasLyrics = true;
-          } else if (cancelled()) {
-            finished = false; // interrupted: try this song again later
-          } else if (!cacheDir.empty()) {
-            writeFileAtomic(noGen,
-                            ""); // it heard nothing: do not retry forever
-          }
-        }
-      }
+    if (!found && online) {
+      transient = !recentlyNotFound(cacheDir, hexHash(path));
     }
 
     lock.lock();
-    if (finished) {
+    // Interrupted (switched off): do not mark it as done.
+    const bool interrupted = sh->stop || !sh->pfEnabled;
+    if (!interrupted && !transient) {
       sh->pfDone.insert(path);
-      if (hasLyrics)
+      if (found)
         sh->pfFound.insert(path);
-      if (generated)
-        sh->pfGenerated.insert(path);
     }
     lock.unlock();
 
-    if (!finished)
+    if (interrupted)
       prefetchPause(sh, 2.0);
     else if (transient)
       prefetchPause(sh, 20.0); // the server is busy or unreachable: slow down
@@ -1747,10 +1293,7 @@ void workerMain(std::shared_ptr<Manager::Shared> sh) {
       } else {
         sh->result.reset();
         sh->state = State::NotFound;
-        if (sh->pendingGenerate) // G was pressed during the search
-          startGenerationLocked(sh, req.path);
       }
-      sh->pendingGenerate = false;
     }
   }
 }
@@ -1763,12 +1306,6 @@ Manager::~Manager() {
   {
     std::lock_guard<std::mutex> lock(shared_->m);
     shared_->stop = true;
-    cancelGenerationLocked(*shared_); // never leave Whisper running behind us
-    if (shared_->pfPid > 0) {
-      kill(-shared_->pfPid, SIGKILL);
-      kill(shared_->pfPid, SIGKILL);
-      shared_->pfPid = 0;
-    }
   }
   shared_->cv.notify_all();
   shared_->pfCv.notify_all();
@@ -1779,7 +1316,7 @@ void Manager::setCacheDir(const fs::path &dir) {
     std::lock_guard<std::mutex> lock(shared_->m);
     shared_->cacheDir = dir;
   }
-  // Work folders of generations that were killed hard (older than an hour).
+  // Leftover work folders of older versions (older than an hour).
   std::error_code ec;
   for (fs::directory_iterator it(dir / "lyrics", ec), end; !ec && it != end;
        it.increment(ec)) {
@@ -1804,9 +1341,6 @@ void Manager::request(const std::string &songPath, double durationSeconds) {
     return;
   shared_->currentSong = songPath;
   ++shared_->generation;
-  cancelGenerationLocked(*shared_);
-  shared_->pendingGenerate = false;
-  shared_->lastError.clear();
   shared_->state = State::Loading;
   shared_->result.reset(); // never show the previous song's lyrics
   shared_->pending = {songPath, durationSeconds};
@@ -1829,73 +1363,10 @@ std::shared_ptr<const Result> Manager::result() const {
   return shared_->result;
 }
 
-bool Manager::generate(const std::string &songPath, double /*duration*/) {
-  const std::string bin = generatorCommand(); // file-system access: no lock
-  const std::string model = generatorModel();
-  const char *langEnv = std::getenv("MUZX_WHISPER_LANG");
-  const std::string language = langEnv ? langEnv : "";
-
-  std::lock_guard<std::mutex> lock(shared_->m);
-  Shared &s = *shared_;
-  if (songPath != s.currentSong || s.generating || s.pendingGenerate)
-    return false;
-  if (bin.empty()) {
-    s.lastError = "Whisper is not installed";
-    return false;
-  }
-  s.genModel = model;
-  s.genLanguage = language;
-
-  if (s.state == State::Loading) { // still searching: start right after it
-    s.pendingGenerate = true;
-    s.lastError.clear();
-    return true;
-  }
-  const bool redo = s.state == State::Ready && s.result &&
-                    startsWith(s.result->source, "generated");
-  if (s.state != State::NotFound && !redo)
-    return false;
-  startGenerationLocked(shared_, songPath);
-  return true;
-}
-
-bool Manager::generatePending() const {
-  std::lock_guard<std::mutex> lock(shared_->m);
-  return shared_->pendingGenerate;
-}
-
-void Manager::cancelGenerate() {
-  std::lock_guard<std::mutex> lock(shared_->m);
-  if (shared_->pendingGenerate) {
-    shared_->pendingGenerate = false;
-    return;
-  }
-  if (!shared_->generating)
-    return;
-  cancelGenerationLocked(*shared_);
-  shared_->state = State::NotFound;
-  shared_->lastError = "cancelled";
-}
-
-double Manager::generatingSeconds() const {
-  std::lock_guard<std::mutex> lock(shared_->m);
-  if (!shared_->generating)
-    return 0.0;
-  return std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                       shared_->genStart)
-      .count();
-}
-
-void Manager::setPrefetch(bool enabled, bool useWhisper) {
+void Manager::setPrefetch(bool enabled) {
   std::lock_guard<std::mutex> lock(shared_->m);
   Shared &s = *shared_;
   s.pfEnabled = enabled;
-  s.pfWhisper = enabled && useWhisper;
-  if (!enabled &&
-      s.pfPid > 0) { // switched off: stop a running background Whisper
-    kill(-s.pfPid, SIGKILL);
-    kill(s.pfPid, SIGKILL);
-  }
   if (enabled && !s.pfStarted) {
     s.pfStarted = true;
     std::thread(prefetchMain, shared_).detach();
@@ -1914,24 +1385,15 @@ Manager::PrefetchStatus Manager::prefetchStatus() const {
   const Shared &s = *shared_;
   PrefetchStatus st;
   st.enabled = s.pfEnabled;
-  st.whisper = s.pfWhisper;
   st.total = s.pfQueue.size();
   for (const std::string &song : s.pfQueue) {
     if (s.pfDone.count(song))
       ++st.processed;
     if (s.pfFound.count(song))
       ++st.found;
-    if (s.pfGenerated.count(song))
-      ++st.generated;
   }
-  st.whisperRunning = s.pfPid > 0;
   st.current = s.pfCurrent;
   return st;
-}
-
-std::string Manager::lastError() const {
-  std::lock_guard<std::mutex> lock(shared_->m);
-  return shared_->lastError;
 }
 
 } // namespace lyrics

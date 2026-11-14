@@ -13,7 +13,6 @@ any modern terminal.
 - Browse folders, queue songs, search by filename, shuffle and repeat
 - **Synced lyrics**, like Spotify: the line being sung is highlighted
   - looked up automatically online (lrclib) and cached
-  - songs without lyrics can be **generated with Whisper** (timed, offline)
   - **timing offset** per song: `[` / `]` shift the lyrics earlier / later
   - **background preparation** of lyrics for the other songs (Settings)
 - Album art, audio visualizer, listening statistics
@@ -28,14 +27,13 @@ any modern terminal.
 
 ## Requirements
 
-| Needed for                                    | Package (Arch)                     |
-| --------------------------------------------- | ---------------------------------- |
-| everything                                    | `gcc`, `sfml`, `systemd-libs`      |
-| cover art, font size                          | `kitty`                            |
-| Whisper lyrics (optional)                     | `pipx install whisper-ctranslate2` |
-| Japanese kanji on the LCD (optional)          | `kakasi` (AUR)                     |
-| notifications (optional)                      | `libnotify`                        |
-| media keys on i3 / Sway / Hyprland (optional) | `playerctl`                        |
+| Needed for                                    | Package (Arch)                |
+| --------------------------------------------- | ----------------------------- |
+| everything                                    | `gcc`, `sfml`, `systemd-libs` |
+| cover art, font size                          | `kitty`                       |
+| Japanese kanji on the LCD (optional)          | `kakasi` (AUR)                |
+| notifications (optional)                      | `libnotify`                   |
+| media keys on i3 / Sway / Hyprland (optional) | `playerctl`                   |
 
 ## Build
 
@@ -64,8 +62,6 @@ On the first start MUZX asks for your music folder.
 | `x`                          | Stop                                                           |
 | `i` / `v`                    | Album art / visualizer on or off                               |
 | `L`                          | Lyrics panel: right, below, off                                |
-| `G`                          | Generate lyrics with Whisper (press again to cancel)           |
-| `A`                          | Auto-generate lyrics when a song has none                      |
 | `[` `]`                      | Lyrics earlier / later by 0.5 s (saved for this song)          |
 | `\`                          | Reset the lyrics timing of this song                           |
 | `T`                          | Lyrics on the Arduino LCD, on or off                           |
@@ -91,7 +87,7 @@ Turn the mouse off with `MUZX_MOUSE=0`.
 Move with `j`/`k`, change with `Enter` or `←`/`→` (or click). Saved in
 `~/.config/muzx/settings.conf`.
 
-Repeat, lyrics panel position, auto-generate, Whisper model and language,
+Repeat, lyrics panel position,
 prepare lyrics (background queue, see below), LCD
 on/off and Japanese mode, album art, visualizer, layout (normal or compact),
 control buttons, notifications, theme (Purple, Ocean, Forest, Sunset, Mono,
@@ -108,11 +104,9 @@ allow_remote_control yes
 
 MUZX uses a `.lrc` file next to the song, lyrics stored in the file's tags,
 its own cache, and online sources (lrclib, then `syncedlyrics` if it is
-installed). If nothing is found and auto-generate is on, Whisper creates timed
-lyrics in the background (a few minutes per song on a CPU). Everything is
-cached in `~/.config/muzx/lyrics/`, so each song is only processed once.
-
-Set the language (`ja`, `hi`, `en`, ...) in Settings for better results.
+installed). Everything found is cached in `~/.config/muzx/lyrics/`, so each
+song is only looked up once. For a song nobody has lyrics for, put a `.lrc`
+file with the same name next to it.
 
 **Lyrics out of sync?** Press `]` if the lyrics come too early, `[` if they
 come too late (0.5 s per press, shown as "sync +1.0s" in the panel title).
@@ -124,11 +118,8 @@ can look up lyrics for the other songs in the background, the rest of the
 playlist first, then the whole music folder, one song at a time.
 
 - _Off_ (default): nothing happens in the background.
-- _Online only_: only the web lookup, which is light.
-- _Online + Whisper_: songs that no source has are generated with Whisper.
-  This is heavy (it runs at low priority with one CPU thread and pauses when
-  you press `G` or a generation for the current song runs), so use it when
-  the computer is idle. A song Whisper heard nothing in is not retried.
+- _On_: lyrics are looked up on the web, one song at a time. This is light.
+  Songs that nobody has are remembered for 3 days and not asked again.
 
 Background lookups do not know the song length, so a version of the lyrics
 with a different length may be picked; use `[` / `]` to fix the timing.
@@ -177,13 +168,12 @@ Stop it before uploading a new sketch: `systemctl --user stop muzxlcd`.
 
 ## Environment variables
 
-| Variable                                                  | Meaning                          |
-| --------------------------------------------------------- | -------------------------------- |
-| `MUZX_MOUSE=0`                                            | turn the mouse off               |
-| `MUZX_MPRIS=0`                                            | turn desktop media keys off      |
-| `MUZX_LYRICS_ONLINE=0`                                    | no online lyrics lookup          |
-| `MUZX_WHISPER`, `MUZX_WHISPER_MODEL`, `MUZX_WHISPER_LANG` | Whisper command, model, language |
-| `MUZX_LCD`, `MUZX_LCD_PORT`, `MUZX_LCD_KANA`              | LCD options (see above)          |
+| Variable                                     | Meaning                     |
+| -------------------------------------------- | --------------------------- |
+| `MUZX_MOUSE=0`                               | turn the mouse off          |
+| `MUZX_MPRIS=0`                               | turn desktop media keys off |
+| `MUZX_LYRICS_ONLINE=0`                       | no online lyrics lookup     |
+| `MUZX_LCD`, `MUZX_LCD_PORT`, `MUZX_LCD_KANA` | LCD options (see above)     |
 
 ## Files
 
@@ -194,8 +184,8 @@ Stop it before uploading a new sketch: `systemctl --user stop muzxlcd`.
 
 - **Media keys do nothing:** on i3/Sway/Hyprland install `playerctl` and bind
   the keys. If a browser is playing, use `playerctl -p muzx ...`.
-- **No lyrics generated:** run `pipx install whisper-ctranslate2`; Settings
-  shows "(Whisper not installed)" until it is found.
+- **No lyrics for a song:** the web sources do not have it. Put a `.lrc`
+  file with the same name next to the song.
 - **LCD stays blank:** try address `0x3F`, turn the contrast knob, close the
   Arduino serial monitor, and check port permissions.
 - **Font size fails:** add `allow_remote_control yes` to `kitty.conf`.

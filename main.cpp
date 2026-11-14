@@ -610,10 +610,6 @@ struct AppState {
   bool showAlbumArt = false;
   bool showVisualizer = false;
   LyricsMode lyricsMode = LyricsMode::Right; // "L": Off -> Right -> Bottom
-  bool lyricsAutoGen =
-      true; // "A": generate lyrics when none exist (default ON)
-  bool lyricsAutoTried = false;  // auto-generation already tried for this song
-  bool whisperAvailable = false; // a whisper command was found
   std::chrono::steady_clock::time_point lyricsSongSince{};
   lyrics::Manager lyricsMgr; // finds lyrics on a background thread
   Mpris mpris;               // desktop media keys / playerctl (D-Bus)
@@ -621,9 +617,7 @@ struct AppState {
   // Settings tab
   selection settingsCursor;
   int theme = 0;
-  int fontSize = 0;         // 0 = leave the terminal's font alone
-  std::string whisperModel; // "" = default / environment
-  std::string whisperLang;  // "" = automatic
+  int fontSize = 0; // 0 = leave the terminal's font alone
   fs::path settingsFile;
   std::string settingsSaved; // what is on disk now
   std::string settingsNote;  // message shown at the bottom of the tab
@@ -636,7 +630,8 @@ struct AppState {
   fs::path lyricShiftFile;
   double volumeBeforeMute = 1.0; // 0..1, for click-to-mute
   // Background lyrics preparation (Settings: "Prepare lyrics")
-  int prefetchMode = 0;             // 0 off, 1 online only, 2 online + Whisper
+  int prefetchMode =
+      0; // 0 off, 1 look up lyrics of other songs in the background
   std::vector<std::string> library; // every song under musicRoot
   fs::path libraryRoot;
   std::string prefetchKey; // when this changes, the queue is rebuilt
@@ -1438,8 +1433,6 @@ void drawKeybindings() {
   row("i", "Toggle Album Art");
   row("v", "Toggle Audio Visualizer");
   row("L", "Lyrics: right panel / below / off");
-  row("G", "Generate lyrics with Whisper (G again cancels)");
-  row("A", "Auto-generate lyrics when none exist");
   row("T", "Show the lyrics on the Arduino LCD (on / off)");
   row("m  /  M",
       "LCD mode: next / previous (lyrics, clock, PC status ... needs muzxlcd)");
@@ -1742,9 +1735,6 @@ void notifySongChange(AppState &app) {
 enum SettingItem {
   SetRepeat = 0, // playback
   SetLyrics,
-  SetAutoGen,
-  SetModel,
-  SetLang,
   SetPrefetch, // lyrics
   SetLcd,
   SetLcdKana, // LCD
@@ -1763,35 +1753,10 @@ enum SettingItem {
   kSettingCount
 };
 
-const char *const kModelChoices[] = {"",      "tiny",   "base",
-                                     "small", "medium", "large-v3"};
-const char *const kLangChoices[] = {"",   "en", "hi", "ja", "ko", "zh",
-                                    "es", "fr", "de", "ru", "pt", "it",
-                                    "ar", "ur", "pa", "ta", "te", "bn"};
 const int kFontChoices[] = {0, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28};
 
 int cycleIndex(int current, int dir, int count) {
   return ((current + dir) % count + count) % count;
-}
-
-template <std::size_t N>
-int indexOfString(const char *const (&list)[N], const std::string &value) {
-  for (std::size_t i = 0; i < N; ++i)
-    if (value == list[i])
-      return static_cast<int>(i);
-  return 0;
-}
-
-// Whisper reads its model and language from the environment each time it runs.
-void applyWhisperEnv(const AppState &app, bool clearWhenEmpty) {
-  if (!app.whisperModel.empty())
-    setenv("MUZX_WHISPER_MODEL", app.whisperModel.c_str(), 1);
-  else if (clearWhenEmpty)
-    unsetenv("MUZX_WHISPER_MODEL");
-  if (!app.whisperLang.empty())
-    setenv("MUZX_WHISPER_LANG", app.whisperLang.c_str(), 1);
-  else if (clearWhenEmpty)
-    unsetenv("MUZX_WHISPER_LANG");
 }
 
 // Font size can only be changed by Kitty itself, through its remote control.
@@ -1811,9 +1776,6 @@ std::string settingsToText(const AppState &app) {
   std::ostringstream out;
   out << "repeat=" << static_cast<int>(app.repeat) << "\n"
       << "lyrics_mode=" << static_cast<int>(app.lyricsMode) << "\n"
-      << "auto_generate=" << (app.lyricsAutoGen ? 1 : 0) << "\n"
-      << "whisper_model=" << app.whisperModel << "\n"
-      << "whisper_lang=" << app.whisperLang << "\n"
       << "prefetch=" << app.prefetchMode << "\n"
       << "lcd=" << (app.lcd.enabled() ? 1 : 0) << "\n"
       << "lcd_kana=" << (app.lcd.kana() ? 1 : 0) << "\n"
@@ -1870,7 +1832,6 @@ void loadSettings(AppState &app) {
     if (mode >= 0 && mode <= 2)
       app.lyricsMode = static_cast<LyricsMode>(mode);
   }
-  flag("auto_generate", app.lyricsAutoGen);
   flag("album_art", app.showAlbumArt);
   flag("compact", app.compact);
   flag("buttons", app.showButtons);
@@ -1886,12 +1847,8 @@ void loadSettings(AppState &app) {
     app.lcd.setEnabled(values["lcd"] == "1");
   if (values.count("lcd_kana"))
     app.lcd.setKana(values["lcd_kana"] == "1");
-  if (values.count("whisper_model"))
-    app.whisperModel = values["whisper_model"];
-  if (values.count("whisper_lang"))
-    app.whisperLang = values["whisper_lang"];
   if (values.count("prefetch"))
-    app.prefetchMode = std::clamp(std::atoi(values["prefetch"].c_str()), 0, 2);
+    app.prefetchMode = std::clamp(std::atoi(values["prefetch"].c_str()), 0, 1);
   if (values.count("theme"))
     for (int i = 0; i < kThemeCount; ++i)
       if (values["theme"] == kThemes[i].name)
@@ -1915,34 +1872,9 @@ void changeSetting(AppState &app, int item, int dir) {
     app.lyricsMode = static_cast<LyricsMode>(
         cycleIndex(static_cast<int>(app.lyricsMode), dir, 3));
     break;
-  case SetAutoGen:
-    app.lyricsAutoGen = !app.lyricsAutoGen;
-    app.lyricsAutoTried = false;
-    app.whisperAvailable = !lyrics::generatorCommand().empty();
-    break;
-  case SetModel: {
-    const int n =
-        static_cast<int>(sizeof(kModelChoices) / sizeof(kModelChoices[0]));
-    app.whisperModel = kModelChoices[cycleIndex(
-        indexOfString(kModelChoices, app.whisperModel), dir, n)];
-    applyWhisperEnv(app, true);
-    break;
-  }
-  case SetLang: {
-    const int n =
-        static_cast<int>(sizeof(kLangChoices) / sizeof(kLangChoices[0]));
-    app.whisperLang = kLangChoices[cycleIndex(
-        indexOfString(kLangChoices, app.whisperLang), dir, n)];
-    applyWhisperEnv(app, true);
-    break;
-  }
   case SetPrefetch:
-    app.prefetchMode = cycleIndex(app.prefetchMode, dir, 3);
-    app.lyricsMgr.setPrefetch(app.prefetchMode >= 1, app.prefetchMode == 2);
-    app.whisperAvailable = !lyrics::generatorCommand().empty();
-    if (app.prefetchMode == 2 && !app.whisperAvailable)
-      app.settingsNote =
-          "Whisper is not installed: only the online lookup will work.";
+    app.prefetchMode = app.prefetchMode == 0 ? 1 : 0;
+    app.lyricsMgr.setPrefetch(app.prefetchMode == 1);
     break;
   case SetLcd:
     app.lcd.toggle();
@@ -2042,25 +1974,13 @@ std::string settingValue(const AppState &app, int item) {
     return app.lyricsMode == LyricsMode::Off     ? "Off"
            : app.lyricsMode == LyricsMode::Right ? "Right of the player"
                                                  : "Below the player";
-  case SetAutoGen:
-    return onOff(app.lyricsAutoGen) +
-           (app.whisperAvailable ? "" : "   (Whisper not installed)");
-  case SetModel:
-    return app.whisperModel.empty() ? "default" : app.whisperModel;
-  case SetLang:
-    return app.whisperLang.empty() ? "automatic" : app.whisperLang;
   case SetPrefetch: {
     if (app.prefetchMode == 0)
       return "Off";
     const lyrics::Manager::PrefetchStatus st = app.lyricsMgr.prefetchStatus();
-    std::string text =
-        app.prefetchMode == 1 ? "Online only" : "Online + Whisper";
-    text += "   (" + std::to_string(st.processed) + "/" +
-            std::to_string(st.total) + " checked, " + std::to_string(st.found) +
-            " ready";
-    if (st.whisperRunning)
-      text += ", generating...";
-    return text + ")";
+    return "On   (" + std::to_string(st.processed) + "/" +
+           std::to_string(st.total) + " checked, " + std::to_string(st.found) +
+           " found)";
   }
   case SetLcd:
     if (!app.lcd.enabled())
@@ -2102,26 +2022,12 @@ std::string settingValue(const AppState &app, int item) {
 }
 
 void drawSettings(const AppState &app) {
-  static const char *const labels[kSettingCount] = {"Repeat",
-                                                    "Lyrics panel",
-                                                    "Auto-generate",
-                                                    "Whisper model",
-                                                    "Whisper language",
-                                                    "Prepare lyrics",
-                                                    "LCD display",
-                                                    "LCD Japanese",
-                                                    "Album art",
-                                                    "Visualizer",
-                                                    "Layout",
-                                                    "Control buttons",
-                                                    "Notifications",
-                                                    "Theme",
-                                                    "Custom: title",
-                                                    "Custom: accent",
-                                                    "Custom: highlight",
-                                                    "Custom: bars",
-                                                    "Font size",
-                                                    "Music folder"};
+  static const char *const labels[kSettingCount] = {
+      "Repeat",          "Lyrics panel",      "Prepare lyrics", "LCD display",
+      "LCD Japanese",    "Album art",         "Visualizer",     "Layout",
+      "Control buttons", "Notifications",     "Theme",          "Custom: title",
+      "Custom: accent",  "Custom: highlight", "Custom: bars",   "Font size",
+      "Music folder"};
   std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
   const std::size_t selected = app.settingsCursor.current();
 
@@ -2342,9 +2248,8 @@ std::string clipColumns(const std::string &text, std::size_t maxCols) {
   return out;
 }
 
-// Asks the lyrics thread for the lyrics of the song that is playing now, and
-// starts automatic generation when it is switched on ("A"). Called every
-// frame; it only does work when the song changes.
+// Asks the lyrics thread for the lyrics of the song that is playing now.
+// Called every frame; it only does work when the song changes.
 void updateLyricsRequest(AppState &app) {
   if ((app.lyricsMode == LyricsMode::Off && !app.lcd.enabled()) ||
       !app.hasCurrentSong)
@@ -2358,19 +2263,8 @@ void updateLyricsRequest(AppState &app) {
   if (app.currentSong != app.lyricsSong) {
     app.lyricsSong = app.currentSong;
     app.lyricsSongSince = now;
-    app.lyricsAutoTried = false;
     app.lyricsMgr.request(app.currentSong, static_cast<double>(duration));
     return;
-  }
-
-  // Automatic generation: only for a song that has been playing for a few
-  // seconds (so skipping through songs does not start and stop Whisper over
-  // and over), and only once per song.
-  if (app.lyricsAutoGen && !app.lyricsAutoTried && app.whisperAvailable &&
-      app.lyricsMgr.state() == lyrics::State::NotFound &&
-      now - app.lyricsSongSince > std::chrono::seconds(5)) {
-    app.lyricsAutoTried = true;
-    app.lyricsMgr.generate(app.currentSong, static_cast<double>(duration));
   }
 }
 
@@ -2516,10 +2410,7 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
     std::snprintf(shift, sizeof(shift), "  sync %+.1fs", app.lyricShift);
     detail += shift;
   }
-  const std::string autoState = app.lyricsAutoGen ? "ON" : "OFF";
-  const std::string hints[] = {"   L move/hide  |  G generate  |  A auto (" +
-                                   autoState + ")",
-                               "   [L] [G] [A]", ""};
+  const std::string hints[] = {"   L move/hide  |  [ ] timing", "   [L]", ""};
   const std::size_t titleRoom = width > 6 ? width - 6 : 0;
   for (const std::string &hint : hints) {
     if (displayWidth(detail + hint) <= titleRoom) {
@@ -2533,36 +2424,11 @@ std::string lyricsPanel(const AppState &app, int rows, int cols, int usedRows) {
   // No lyrics (yet): show a short message in the middle of the box.
   if (!result) {
     std::string message;
-    if (state == lyrics::State::Generating) {
-      const int secs = static_cast<int>(app.lyricsMgr.generatingSeconds());
-      char clock[16];
-      std::snprintf(clock, sizeof(clock), "%d:%02d", secs / 60, secs % 60);
-      message = "Generating lyrics with Whisper (" + lyrics::generatorModel() +
-                ")...  " + clock +
-                "   Press G to cancel. A song can take a few minutes; the "
-                "first run also downloads the model.";
-    } else if (state == lyrics::State::NotFound) {
-      if (app.whisperAvailable && app.lyricsAutoGen && !app.lyricsAutoTried)
-        message = "No lyrics found. Whisper starts generating them in a few "
-                  "seconds (press G to start now).";
-      else if (app.whisperAvailable)
-        message = "No lyrics found. Press G to generate them with Whisper, or "
-                  "A to do it automatically for every song.";
-      else
-        message = "No lyrics found. Put a .lrc file with the same name next to "
-                  "the song, or install Whisper to generate lyrics: pip "
-                  "install openai-whisper";
-      const std::string error = app.lyricsMgr.lastError();
-      if (!error.empty())
-        message += "  (" + error + ")";
-      if (error.rfind("Whisper failed", 0) == 0 ||
-          error.rfind("no lyrics detected", 0) == 0)
-        message += "  Full output: ~/.config/muzx/lyrics/whisper-error.log";
+    if (state == lyrics::State::NotFound) {
+      message = "No lyrics found. Put a .lrc file with the same name next to "
+                "the song, or check your internet connection.";
     } else {
-      message = app.lyricsMgr.generatePending()
-                    ? "Searching for lyrics... Whisper starts right after if "
-                      "none are found (press G to cancel)."
-                    : "Searching for lyrics...";
+      message = "Searching for lyrics...";
     }
     const std::vector<std::string> parts = wrapLyric(message, width);
     int row = top + std::max(0, mid - static_cast<int>(parts.size()) / 2);
@@ -3056,18 +2922,6 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
                                                    : LyricsMode::Off);
     return KeyResult::Handled;
   }
-  if (key == 'G' || key == 'g') {
-    if (app.lyricsMode == LyricsMode::Off) {
-      app.lyricsMode = LyricsMode::Right; // show the lyrics area first
-    } else if (app.lyricsMgr.state() == lyrics::State::Generating ||
-               app.lyricsMgr.generatePending()) {
-      app.lyricsMgr.cancelGenerate(); // G again = cancel
-    } else if (app.hasCurrentSong) {
-      app.whisperAvailable = !lyrics::generatorCommand().empty();
-      app.lyricsMgr.generate(app.currentSong, 0.0);
-    }
-    return KeyResult::Handled;
-  }
   if (key == '[' || key == ']' || key == '\\') {
     // Lyrics timing for this song: [ earlier, ] later, \ reset
     adjustLyricShift(app, key == '[' ? -0.5 : key == ']' ? 0.5 : 0.0);
@@ -3080,12 +2934,6 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   if (key == 'm' || key == 'M') {
     // Change what the Arduino LCD shows (needs the muzxlcd program)
     app.lcd.command(key == 'm' ? "mode next" : "mode prev");
-    return KeyResult::Handled;
-  }
-  if (key == 'A') {
-    app.lyricsAutoGen = !app.lyricsAutoGen;
-    app.lyricsAutoTried = false;
-    app.whisperAvailable = !lyrics::generatorCommand().empty();
     return KeyResult::Handled;
   }
   if (key == 'n' || (app.tab == AppTab::Player && key == 'l')) {
@@ -3272,10 +3120,6 @@ int run() {
   // Lyrics are cached in the same folder. MUZX_LYRICS_ONLINE=0 turns the
   // web lookup off (local .lrc files and tags still work).
   app.lyricsMgr.setCacheDir(configDirectory);
-  app.whisperAvailable = !lyrics::generatorCommand().empty();
-  if (const char *autogen = std::getenv("MUZX_LYRICS_AUTOGEN");
-      autogen && std::string(autogen) == "1")
-    app.lyricsAutoGen = true;
   if (const char *online = std::getenv("MUZX_LYRICS_ONLINE");
       online && std::string(online) == "0")
     app.lyricsMgr.setOnlineEnabled(false);
@@ -3284,9 +3128,8 @@ int run() {
   app.lyricShiftFile = configDirectory / "lyrics-offsets.txt";
   loadLyricShifts(app);
   loadSettings(app);
-  app.lyricsMgr.setPrefetch(app.prefetchMode >= 1, app.prefetchMode == 2);
+  app.lyricsMgr.setPrefetch(app.prefetchMode >= 1);
   applyTheme(app.theme);
-  applyWhisperEnv(app, false);
   if (app.fontSize > 0)
     applyFontSize(app.fontSize); // before the screen switches to raw mode
 

@@ -28,7 +28,7 @@ struct Result {
   std::vector<Line> lines; // sorted by time when synced
 };
 
-enum class State { Idle, Loading, Ready, NotFound, Generating };
+enum class State { Idle, Loading, Ready, NotFound };
 
 // ---- helpers (public so they can be tested) --------------------------------
 std::string sanitize(const std::string &text); // strips control codes
@@ -45,17 +45,6 @@ std::string urlEncode(const std::string &text);
 void pickFromLrclib(const std::string &json, double duration, Result &synced,
                     Result &plain,
                     const std::vector<std::string> &wantedTitles = {});
-
-// ---- auto-generated lyrics (speech recognition with Whisper) ---------------
-// Reads the JSON that the `whisper` command-line tool writes
-// (--output_format json) and turns its segments into timed lines.
-Result parseWhisperJson(const std::string &json);
-// Full path of the whisper command that will be used, or "" if none is
-// installed. $MUZX_WHISPER overrides the search ("whisper",
-// "whisper-ctranslate2").
-std::string generatorCommand();
-// Model name passed to whisper: $MUZX_WHISPER_MODEL, default "small".
-std::string generatorModel();
 
 class Manager {
 public:
@@ -74,34 +63,17 @@ public:
   State state() const;
   std::shared_ptr<const Result> result() const; // null unless state()==Ready
 
-  // Generates lyrics for the current song with Whisper, in a child process
-  // that is killed again when you skip the song, cancel, or quit. Works when
-  // no lyrics were found (or to redo lyrics that were generated before).
-  // Returns false if it could not start (see lastError()).
-  bool generate(const std::string &songPath, double durationSeconds);
-  void cancelGenerate(); // also cancels a generation that is still waiting
-  // True when generate() was called while the lyrics search was still running:
-  // Whisper then starts right after that search, if it finds nothing.
-  bool generatePending() const;
-  double generatingSeconds() const; // time since generation started, else 0
-  std::string lastError() const;    // why the last generation / start failed
-
   // ---- background preparation ----------------------------------------------
-  // Looks up (and, with `useWhisper`, generates) lyrics for the songs in the
-  // queue, one at a time, while you listen to something else. Whisper only
-  // runs for songs that no source has, at low priority, and it stops as soon
-  // as you press G yourself. Everything is cached, so a song is done once.
+  // Looks up lyrics for the songs in the queue, one at a time, while you
+  // listen to something else. Everything is cached, so a song is done once.
   struct PrefetchStatus {
     bool enabled = false;
-    bool whisper = false;
     std::size_t processed = 0; // songs of the queue that are finished
     std::size_t total = 0;     // songs in the queue
     std::size_t found = 0;     // finished songs that have lyrics
-    std::size_t generated = 0; // of those, made by Whisper in this session
-    bool whisperRunning = false;
-    std::string current; // the song being worked on
+    std::string current;       // the song being worked on
   };
-  void setPrefetch(bool enabled, bool useWhisper);
+  void setPrefetch(bool enabled);
   void setPrefetchQueue(const std::vector<std::string> &songs); // in this order
   PrefetchStatus prefetchStatus() const;
 
