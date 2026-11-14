@@ -1441,6 +1441,8 @@ void drawKeybindings() {
   row("G", "Generate lyrics with Whisper (G again cancels)");
   row("A", "Auto-generate lyrics when none exist");
   row("T", "Show the lyrics on the Arduino LCD (on / off)");
+  row("m  /  M",
+      "LCD mode: next / previous (lyrics, clock, PC status ... needs muzxlcd)");
   row("[  /  ]  /  \\",
       "Lyrics earlier / later by 0.5 s (saved per song) / reset");
   row("+ / -", "Adjust volume");
@@ -2061,10 +2063,12 @@ std::string settingValue(const AppState &app, int item) {
     return text + ")";
   }
   case SetLcd:
-    return app.lcd.enabled()
-               ? (app.lcd.connected() ? "On (connected)"
-                                      : "On (waiting for the Arduino)")
-               : "Off";
+    if (!app.lcd.enabled())
+      return "Off";
+    if (app.lcd.viaHub())
+      return "On (through the LCD hub)";
+    return app.lcd.connected() ? "On (connected)"
+                               : "On (waiting for the Arduino)";
   case SetLcdKana:
     return app.lcd.kana() ? "Katakana (Japanese ROM)" : "Romaji (any LCD)";
   case SetArt:
@@ -3071,6 +3075,11 @@ KeyResult handleKey(AppState &app, int key, const fs::path &queueFile) {
   }
   if (key == 'T') {
     app.lcd.toggle(); // LCD on/off
+    return KeyResult::Handled;
+  }
+  if (key == 'm' || key == 'M') {
+    // Change what the Arduino LCD shows (needs the muzxlcd program)
+    app.lcd.command(key == 'm' ? "mode next" : "mode prev");
     return KeyResult::Handled;
   }
   if (key == 'A') {

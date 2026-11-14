@@ -1,0 +1,13 @@
+[Unit]
+Description=MUZX LCD hub (Arduino LCD: lyrics, clock, PC status, captions)
+
+[Service]
+# systemd services do not read your shell config: this is where curl, yt-dlp
+# (pip/pipx installs go to ~/.local/bin) and kakasi are found.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/muzxlcd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

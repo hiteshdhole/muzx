@@ -957,9 +957,23 @@ static std::string findSyncedLyrics(const PlayerInfo &p, bool &transient) {
 struct Lookup {
   enum State { Searching, Ready, None, NoTool, Failed };
   std::atomic<int> state{Searching};
+  std::atomic<long long> doneMs{0}; // when the lookup finished (steady clock)
   std::mutex mu;
   std::vector<TimedLine> lines;
   std::string key;
+
+  static long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               Clock::now().time_since_epoch())
+        .count();
+  }
+  void finish(State s) {
+    doneMs = nowMs();
+    state = s;
+  }
+  double ageSeconds() const {
+    return static_cast<double>(nowMs() - doneMs) / 1000.0;
+  }
 };
 
 static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
@@ -981,7 +995,7 @@ static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
                fs::file_time_type::clock::now() -
                        fs::last_write_time(noneFile, ec) <
                    std::chrono::hours(24)) {
-      lookup->state = Lookup::None;
+      lookup->finish(Lookup::None);
       return;
     } else {
       bool transient = false;
@@ -989,7 +1003,7 @@ static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
       if (!lrc.empty()) {
         std::ofstream(lrcFile) << lrc;
       } else if (transient) {
-        lookup->state = Lookup::Failed;
+        lookup->finish(Lookup::Failed);
         return;
       } else {
         std::ofstream(noneFile) << "none\n";
@@ -997,14 +1011,14 @@ static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
     }
     std::vector<TimedLine> lines = parseLrc(lrc);
     if (lines.empty()) {
-      lookup->state = Lookup::None;
+      lookup->finish(Lookup::None);
       return;
     }
     {
       std::lock_guard<std::mutex> lock(lookup->mu);
       lookup->lines = std::move(lines);
     }
-    lookup->state = Lookup::Ready;
+    lookup->finish(Lookup::Ready);
   }).detach();
   return lookup;
 }
@@ -1064,25 +1078,25 @@ static std::shared_ptr<Lookup> startCaptionLookup(const PlayerInfo &p,
                   "https://www.youtube.com/watch?v=" + id},
                  ok, &code);
       if (code == 127) {
-        lookup->state = Lookup::NoTool;
+        lookup->finish(Lookup::NoTool);
         return;
       }
       vtt = findVtt();
     }
     if (vtt.empty()) {
-      lookup->state = Lookup::None;
+      lookup->finish(Lookup::None);
       return;
     }
     std::vector<TimedLine> lines = parseVtt(readFile(vtt));
     if (lines.empty()) {
-      lookup->state = Lookup::None;
+      lookup->finish(Lookup::None);
       return;
     }
     {
       std::lock_guard<std::mutex> lock(lookup->mu);
       lookup->lines = std::move(lines);
     }
-    lookup->state = Lookup::Ready;
+    lookup->finish(Lookup::Ready);
   }).detach();
   return lookup;
 }
@@ -1275,6 +1289,13 @@ public:
 
   bool connected() const { return fd_ >= 0; }
   int fd() const { return fd_; }
+  void setKana(bool on) {
+    if (cfg_.kana == on)
+      return;
+    cfg_.kana = on;
+    convIn_.clear();
+    last_.clear(); // redraw with the new character set
+  }
   const std::string &port() const { return port_; }
 
   // Call every loop; (re)opens the port when needed.
@@ -1329,8 +1350,8 @@ public:
       return; // the Uno restarts when the port opens
     std::string msg;
     if (f.rows)
-      msg = convert(fit(f.a, cfg_.cols)) + '\x01' +
-            convert(fit(f.b, cfg_.cols)) + '\n';
+      msg = fit(convert(f.a), cfg_.cols) + '\x01' +
+            fit(convert(f.b), cfg_.cols) + '\n';
     else
       msg = convert(f.text) + '\n';
     if (msg == last_ && now - lastWrite_ < std::chrono::milliseconds(2500))
@@ -1512,6 +1533,10 @@ private:
     if (cmd == "lyric") { // pushed by MUZX
       pushed_ = arg;
       pushedAt_ = Clock::now();
+      return "ok";
+    }
+    if (cmd == "kana") { // the player's "Japanese as katakana" setting
+      lcd_.setKana(arg == "1");
       return "ok";
     }
     if (cmd == "mode") {
@@ -1737,7 +1762,10 @@ private:
         return textFrame(pushed_); // MUZX sends its own lyrics line
       return rowsFrame(center("No music", cols), center("playing", cols));
     }
-    if (!lyrics_ || lyrics_->key != p->key())
+    // A failed lookup (no network yet, ...) is tried again after a while.
+    const bool retry = lyrics_ && lyrics_->state == Lookup::Failed &&
+                       lyrics_->ageSeconds() > 20.0;
+    if (!lyrics_ || lyrics_->key != p->key() || retry)
       lyrics_ = startLyricsLookup(*p);
     if (lyrics_->state == Lookup::Ready) {
       std::lock_guard<std::mutex> lock(lyrics_->mu);
@@ -1771,7 +1799,15 @@ private:
       return rowsFrame(center("No YouTube", cols),
                        center("video playing", cols));
     const std::string key = youtubeId(p->url) + "|" + cfg_.captionsLang;
-    if (!captions_ || captions_->key != key)
+    // Try again later: yt-dlp may have been installed, or the network was down.
+    bool retry = false;
+    if (captions_) {
+      const int st = captions_->state;
+      const double age = captions_->ageSeconds();
+      retry = (st == Lookup::NoTool && age > 15.0) ||
+              ((st == Lookup::Failed || st == Lookup::None) && age > 120.0);
+    }
+    if (!captions_ || captions_->key != key || retry)
       captions_ = startCaptionLookup(*p, cfg_.captionsLang);
     switch (captions_->state.load()) {
     case Lookup::Searching:

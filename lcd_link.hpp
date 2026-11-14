@@ -854,6 +854,13 @@ public:
   }
   const std::string &port() const { return port_; }
 
+  // Sends a command to the muzxlcd program, e.g. "mode next".
+  // Returns false when muzxlcd is not running.
+  bool command(const std::string &cmd) { return sendRaw(cmd) >= 0; }
+
+  // True while the lines go through the muzxlcd program.
+  bool viaHub() const { return viaDaemon_; }
+
   void toggle() {
     enabled_ = !enabled_;
     if (!enabled_)
@@ -938,31 +945,40 @@ private:
     return "/tmp/muzxlcd-" + std::to_string(getuid()) + ".sock";
   }
 
+  // One datagram to muzxlcd. Returns the sendto() result (-1 = not running).
+  ssize_t sendRaw(const std::string &msg) {
+    if (daemonFd_ < 0)
+      daemonFd_ =
+          ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (daemonFd_ < 0)
+      return -1;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    const std::string path = daemonSocketPath();
+    if (path.size() >= sizeof(addr.sun_path))
+      return -1;
+    std::copy(path.begin(), path.end(), addr.sun_path);
+    const ssize_t n =
+        ::sendto(daemonFd_, msg.data(), msg.size(), MSG_DONTWAIT,
+                 reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    return (n < 0 && errno == EAGAIN) ? 0
+                                      : n; // a full queue is not "not running"
+  }
+
   // true = the line went to muzxlcd (or was already sent recently).
   bool sendToDaemon(const std::string &text,
                     std::chrono::steady_clock::time_point now) {
     if (viaDaemon_ && text == daemonText_ &&
         now - daemonSentAt_ < std::chrono::milliseconds(1500))
       return true;
-    if (daemonFd_ < 0)
-      daemonFd_ =
-          ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (daemonFd_ < 0)
-      return false;
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    const std::string path = daemonSocketPath();
-    if (path.size() >= sizeof(addr.sun_path))
-      return false;
-    std::copy(path.begin(), path.end(), addr.sun_path);
     std::string msg = "lyric " + text;
     for (char &c : msg)
       if (c == '\n' || c == '\r')
         c = ' ';
-    const ssize_t n =
-        ::sendto(daemonFd_, msg.data(), msg.size(), MSG_DONTWAIT,
-                 reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-    if (n < 0 && errno != EAGAIN) {
+    // the character-set setting travels with every line (cheap, and it also
+    // reaches a muzxlcd that was restarted)
+    if (sendRaw(std::string("kana ") + (kanaMode_ ? "1" : "0")) < 0 ||
+        sendRaw(msg) < 0) {
       viaDaemon_ = false;
       return false;
     }

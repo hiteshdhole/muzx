@@ -1,68 +1,201 @@
-# MUZX LCD hub
+# MUZX
 
-One small program (`muzxlcd`) owns the Arduino LCD and shows different things
-on it. MUZX sends its lyrics to it automatically.
+A terminal music player for Linux with a Spotify-style lyrics panel, album art,
+a live audio visualizer, desktop media-key support and an optional Arduino LCD
+that shows the line being sung.
 
-| Mode         | Shows                                                                                                                                     |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `lyrics`     | Synced lyrics of whatever is playing: Spotify, YouTube Music, a browser tab, MUZX ... (found through the desktop media info, then lrclib) |
-| `captions`   | Captions of the YouTube video playing in the browser (needs `yt-dlp`)                                                                     |
-| `nowplaying` | Title and artist                                                                                                                          |
-| `clock`      | Time and date                                                                                                                             |
-| `status`     | CPU, RAM, temperature, network speed, battery, uptime (pages change every 3 s)                                                            |
+Built with C++17 and SFML. Made for the [Kitty](https://sw.kovidgoyal.net/kitty/)
+terminal (cover art uses Kitty's graphics protocol); everything else works in
+any modern terminal.
 
-## Setup
+## Features
 
-1. **Wire the button** (optional but nice): one leg to **D2**, the other leg to
-   **GND**. No resistor needed.
-2. **Upload `muzx_lcd.ino`** to the Uno again (it adds the button and the
-   two-row screens). Close the Serial Monitor afterwards.
-3. **Build and start the program**:
-   ```
-   make muzxlcd
-   make install-lcd      # copies it to ~/.local/bin and starts it at login
-   ```
-   or just run `./muzxlcd &` to try it.
+- Browse folders, queue songs, search by filename, shuffle and repeat
+- **Synced lyrics**, like Spotify: the line being sung is highlighted
+  - looked up automatically online (lrclib) and cached
+  - songs without lyrics can be **generated with Whisper** (timed, offline)
+  - **timing offset** per song: `[` / `]` shift the lyrics earlier / later
+  - **background preparation** of lyrics for the other songs (Settings)
+- Album art, audio visualizer, listening statistics
+- **Mouse support**: clickable tabs, shuffle / previous / play-pause / next /
+  repeat buttons, list rows, **drag the progress bar to seek**, **click the
+  volume number to mute**; the wheel scrolls and changes volume
+- **Media keys and `playerctl`** work everywhere on the desktop (MPRIS)
+- **Settings tab** with themes, a custom colour editor, font size, and more
+- Desktop notification when a new song starts
+- Lyrics on an **I2C LCD** (Arduino Uno), with Japanese, Hindi, Punjabi, Urdu
+  and other scripts converted to readable letters
 
-Only one program may use the Uno at a time. While `muzxlcd` runs, MUZX sends
-its lyrics to it; when it is not running, MUZX talks to the Uno directly like
-before.
+## Requirements
 
-## Switching modes
+| Needed for                                    | Package (Arch)                     |
+| --------------------------------------------- | ---------------------------------- |
+| everything                                    | `gcc`, `sfml`, `systemd-libs`      |
+| cover art, font size                          | `kitty`                            |
+| Whisper lyrics (optional)                     | `pipx install whisper-ctranslate2` |
+| Japanese kanji on the LCD (optional)          | `kakasi` (AUR)                     |
+| notifications (optional)                      | `libnotify`                        |
+| media keys on i3 / Sway / Hyprland (optional) | `playerctl`                        |
 
-- **Button:** short press = next mode, long press (0.7 s) = previous mode.
-  The screen shows the mode name for a moment.
-- **PC:** `muzxlcd ctl mode next`, `... prev`, `... clock`, `... lyrics`,
-  `... captions`, `... nowplaying`, `... status`. Bind these to keyboard
-  shortcuts in your window manager if you like. `muzxlcd ctl status` shows the
-  current mode and port, `muzxlcd ctl modes` lists them.
+## Build
 
-The last mode is remembered.
-
-## Settings (optional)
-
-`~/.config/muzx/lcd.conf`, one `key=value` per line:
-
-```
-modes=lyrics,captions,nowplaying,clock,status   # which modes, in this order
-cols=16                                         # 20 for a 20x4 screen
-port=/dev/ttyUSB0
-captions_lang=en                                # language for YouTube captions
-page_seconds=3                                  # time per PC status page
-kana=0                                          # 1 = Japanese as katakana
+```bash
+g++ -std=c++17 -O2 -pthread main.cpp lyrics.cpp audio_player.cpp cover.cpp \
+    queue.cpp selection.cpp config.cpp -o player \
+    -lsfml-audio -lsfml-system -lsystemd
+./player
 ```
 
-## Notes
+Do not compile the test files (`*_test.cpp`, `keytest.cpp`): they have their
+own `main()`.
 
-- **Spotify / YouTube lyrics** are looked up by artist and title on lrclib and
-  cached in `~/.cache/muzxlcd/`. Browser titles like `Artist - Song (Official
-Video)` are cleaned up first. If lrclib has no synced lyrics for a song, the
-  screen shows the title and artist instead.
-- **YouTube captions** need `yt-dlp` (`sudo pacman -S yt-dlp`) and a browser
-  that reports the video address to the desktop (Chromium and Firefox do).
-  Captions are fetched once per video, so the first seconds can show
-  "Getting captions". Live streams have no captions this way.
-- **MUZX lyrics** are used while MUZX is the one playing, including lyrics
-  generated by Whisper.
-- If nothing happens: `muzxlcd ctl status` (is it running, is the Uno found),
-  and `journalctl --user -u muzxlcd` when started with `make install-lcd`.
+On the first start MUZX asks for your music folder.
+
+## Keys
+
+| Key                          | Action                                                         |
+| ---------------------------- | -------------------------------------------------------------- |
+| `Space`                      | Play / pause                                                   |
+| `←` `→` or `a` `d`           | Seek backward / forward                                        |
+| `n` / `b`                    | Next / previous song                                           |
+| `s`                          | Shuffle on / off                                               |
+| `R`                          | Repeat: off, all songs, one song                               |
+| `+` `-`                      | Volume                                                         |
+| `x`                          | Stop                                                           |
+| `i` / `v`                    | Album art / visualizer on or off                               |
+| `L`                          | Lyrics panel: right, below, off                                |
+| `G`                          | Generate lyrics with Whisper (press again to cancel)           |
+| `A`                          | Auto-generate lyrics when a song has none                      |
+| `[` `]`                      | Lyrics earlier / later by 0.5 s (saved for this song)          |
+| `\`                          | Reset the lyrics timing of this song                           |
+| `T`                          | Lyrics on the Arduino LCD, on or off                           |
+| `m` `M`                      | LCD hub: next / previous LCD mode (needs `muzxlcd`, see below) |
+| `Tab` `Shift+Tab` or `1`–`7` | Switch tabs                                                    |
+| `j` `k` or `↑` `↓`           | Move in lists                                                  |
+| `Enter` or `l`               | Open folder / play song                                        |
+| `Backspace` or `h`           | Parent folder                                                  |
+| `p` / `P`                    | Play this folder / play everything                             |
+| `e`                          | Add to queue                                                   |
+| `r` / `c`                    | Remove from queue / clear queue                                |
+| `/`                          | Search                                                         |
+| `q` or `Esc`                 | Quit                                                           |
+
+**Mouse:** click a tab, a button or a list row (click a selected row again to
+open or play it). Press on the progress bar and drag to seek; click the
+"Volume: NN%" text to mute and unmute. The wheel scrolls lists and changes
+the volume on the Player tab. Hold `Shift` to select text normally.
+Turn the mouse off with `MUZX_MOUSE=0`.
+
+## Settings (tab 7)
+
+Move with `j`/`k`, change with `Enter` or `←`/`→` (or click). Saved in
+`~/.config/muzx/settings.conf`.
+
+Repeat, lyrics panel position, auto-generate, Whisper model and language,
+prepare lyrics (background queue, see below), LCD
+on/off and Japanese mode, album art, visualizer, layout (normal or compact),
+control buttons, notifications, theme (Purple, Ocean, Forest, Sunset, Mono,
+Custom), the four custom colours, font size, and the music folder.
+
+**Font size** works only in Kitty and needs this line in
+`~/.config/kitty/kitty.conf` (then restart Kitty):
+
+```
+allow_remote_control yes
+```
+
+## Lyrics
+
+MUZX uses a `.lrc` file next to the song, lyrics stored in the file's tags,
+its own cache, and online sources (lrclib, then `syncedlyrics` if it is
+installed). If nothing is found and auto-generate is on, Whisper creates timed
+lyrics in the background (a few minutes per song on a CPU). Everything is
+cached in `~/.config/muzx/lyrics/`, so each song is only processed once.
+
+Set the language (`ja`, `hi`, `en`, ...) in Settings for better results.
+
+**Lyrics out of sync?** Press `]` if the lyrics come too early, `[` if they
+come too late (0.5 s per press, shown as "sync +1.0s" in the panel title).
+It is remembered for that song in `~/.config/muzx/lyrics-offsets.txt`;
+`\` resets it.
+
+**Prepare lyrics (Settings):** instead of waiting until you play a song, MUZX
+can look up lyrics for the other songs in the background, the rest of the
+playlist first, then the whole music folder, one song at a time.
+
+- _Off_ (default): nothing happens in the background.
+- _Online only_: only the web lookup, which is light.
+- _Online + Whisper_: songs that no source has are generated with Whisper.
+  This is heavy (it runs at low priority with one CPU thread and pauses when
+  you press `G` or a generation for the current song runs), so use it when
+  the computer is idle. A song Whisper heard nothing in is not retried.
+
+Background lookups do not know the song length, so a version of the lyrics
+with a different length may be picked; use `[` / `]` to fix the timing.
+
+## Media keys
+
+MUZX appears as a media player on the desktop (MPRIS). Play/pause, next,
+previous and stop keys work, and so does `playerctl`:
+
+```bash
+playerctl -p muzx play-pause
+playerctl -p muzx volume 0.5
+```
+
+On i3, Sway or Hyprland bind the keys yourself, for example
+`bind = , XF86AudioPlay, exec, playerctl play-pause`.
+Turn it off with `MUZX_MPRIS=0`.
+
+## Arduino LCD
+
+1. Wire the I2C LCD to the Uno: GND, 5V, SDA to A4, SCL to A5.
+2. Install the Arduino library **LiquidCrystal I2C**, open `muzx_lcd.ino`
+   (set `0x27` or `0x3F` and the 16x2 / 20x4 size), and upload it.
+3. Let your user open the port: `sudo usermod -aG uucp $USER`, then log in again.
+4. Start MUZX and press `T`.
+
+### LCD hub (clock, PC status, lyrics from Spotify / YouTube ...)
+
+`muzxlcd` is a small background program that owns the Uno and switches it
+between modes: lyrics of anything playing, YouTube captions, now playing,
+clock and PC status. Switch with a button on the Uno (D2 to GND), with
+`muzxlcd ctl mode next`, or with `m` / `M` in MUZX. While it runs, MUZX sends
+its lyrics to it instead of using the port itself (Settings shows
+"On (through the LCD hub)"). Setup, modes and settings are in `LCD_HUB.md`:
+
+```
+make muzxlcd
+make install-lcd      # copies it to ~/.local/bin and starts it at login
+```
+
+Stop it before uploading a new sketch: `systemctl --user stop muzxlcd`.
+
+`lcdtest.cpp` checks the Arduino without MUZX. Environment variables:
+`MUZX_LCD=1` (on at start), `MUZX_LCD_PORT=/dev/ttyUSB0`, `MUZX_LCD_KANA=1`
+(katakana for LCDs with the Japanese ROM).
+
+## Environment variables
+
+| Variable                                                  | Meaning                          |
+| --------------------------------------------------------- | -------------------------------- |
+| `MUZX_MOUSE=0`                                            | turn the mouse off               |
+| `MUZX_MPRIS=0`                                            | turn desktop media keys off      |
+| `MUZX_LYRICS_ONLINE=0`                                    | no online lyrics lookup          |
+| `MUZX_WHISPER`, `MUZX_WHISPER_MODEL`, `MUZX_WHISPER_LANG` | Whisper command, model, language |
+| `MUZX_LCD`, `MUZX_LCD_PORT`, `MUZX_LCD_KANA`              | LCD options (see above)          |
+
+## Files
+
+`~/.config/muzx/` holds `queue.txt`, `stats.txt`, `settings.conf`,
+`lyrics-offsets.txt` and the `lyrics/` cache.
+
+## Troubleshooting
+
+- **Media keys do nothing:** on i3/Sway/Hyprland install `playerctl` and bind
+  the keys. If a browser is playing, use `playerctl -p muzx ...`.
+- **No lyrics generated:** run `pipx install whisper-ctranslate2`; Settings
+  shows "(Whisper not installed)" until it is found.
+- **LCD stays blank:** try address `0x3F`, turn the contrast knob, close the
+  Arduino serial monitor, and check port permissions.
+- **Font size fails:** add `allow_remote_control yes` to `kitty.conf`.
