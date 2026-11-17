@@ -629,6 +629,10 @@ struct AppState {
   std::map<std::string, double> lyricShifts; // saved per song
   fs::path lyricShiftFile;
   double volumeBeforeMute = 1.0; // 0..1, for click-to-mute
+  // Start with the song that was playing last time (Settings: "On start")
+  int resumeMode = 2;        // 0 off, 1 last song paused, 2 last song playing
+  fs::path lastFile;         // ~/.config/muzx/last.txt
+  std::string lastSavedSong; // song last.txt was written for
   // Background lyrics preparation (Settings: "Prepare lyrics")
   int prefetchMode =
       0; // 0 off, 1 look up lyrics of other songs in the background
@@ -858,7 +862,8 @@ void setShuffle(AppState &app, bool on) {
 }
 
 bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
-                      std::size_t index, bool switchToPlayer = true) {
+                      std::size_t index, bool switchToPlayer = true,
+                      bool countPlay = true) {
   if (songs.empty() || index >= songs.size())
     return false;
   const bool newList =
@@ -883,9 +888,11 @@ bool playFromPlaylist(AppState &app, const std::vector<std::string> &songs,
         app.hasCurrentSong = true;
         app.playbackRunning = true;
         app.paused = false;
-        app.playCounts[path]++;
-        app.statsDirty = true;
-        saveStats(app);
+        if (countPlay) {
+          app.playCounts[path]++;
+          app.statsDirty = true;
+          saveStats(app);
+        }
         if (switchToPlayer)
           app.tab = AppTab::Player;
         loadedSuccessfully = true;
@@ -974,6 +981,72 @@ void checkAutomaticNext(AppState &app) {
   } else {
     app.playbackRunning = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Start with the last played song: ~/.config/muzx/last.txt holds its path and
+// the position (two lines). Written when the song changes, every few seconds
+// and on quit.
+// ---------------------------------------------------------------------------
+void saveLastPlayed(AppState &app) {
+  if (app.lastFile.empty() || !app.hasCurrentSong || app.currentSong.empty())
+    return;
+  double position =
+      static_cast<double>(app.player.getPlayingOffset().asSeconds());
+  if (!std::isfinite(position) || position < 0.0)
+    position = 0.0;
+  fs::path tmp = app.lastFile;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out)
+      return;
+    out << app.currentSong << "\n" << static_cast<long long>(position) << "\n";
+    out.flush();
+    if (!out)
+      return;
+  }
+  std::error_code ec;
+  fs::rename(tmp, app.lastFile, ec);
+  app.lastSavedSong = app.currentSong;
+}
+
+// Returns true when the last song was loaded.
+bool resumeLastPlayed(AppState &app) {
+  std::ifstream in(app.lastFile);
+  std::string song;
+  long long position = 0;
+  if (!std::getline(in, song) || song.empty())
+    return false;
+  in >> position;
+  std::error_code ec;
+  if (!fs::is_regular_file(song, ec))
+    return false; // moved or deleted: just start normally
+
+  // The playlist is the folder of that song, like opening it from the browser.
+  std::vector<std::string> songs =
+      audioFilesIn(fs::path(song).parent_path(), false);
+  std::size_t index = 0;
+  const auto found = std::find(songs.begin(), songs.end(), song);
+  if (found == songs.end())
+    songs = {song};
+  else
+    index = static_cast<std::size_t>(std::distance(songs.begin(), found));
+  if (!playFromPlaylist(app, songs, index, true, false))
+    return false;
+
+  // Continue where it stopped (not when it was almost over).
+  const double duration =
+      static_cast<double>(app.player.getDuration().asSeconds());
+  if (position > 3 &&
+      (!(duration > 0.0) || static_cast<double>(position) < duration - 10.0))
+    app.player.seekForward(static_cast<float>(position));
+  if (app.resumeMode == 1) {
+    app.player.pause();
+    app.paused = true;
+  }
+  app.lastSavedSong = app.currentSong;
+  return true;
 }
 
 void togglePause(AppState &app) {
@@ -1733,7 +1806,8 @@ void notifySongChange(AppState &app) {
 // ---------------------------------------------------------------------------
 
 enum SettingItem {
-  SetRepeat = 0, // playback
+  SetRepeat = 0,
+  SetResume, // playback
   SetLyrics,
   SetPrefetch, // lyrics
   SetLcd,
@@ -1775,6 +1849,7 @@ std::string applyFontSize(int size) {
 std::string settingsToText(const AppState &app) {
   std::ostringstream out;
   out << "repeat=" << static_cast<int>(app.repeat) << "\n"
+      << "resume=" << app.resumeMode << "\n"
       << "lyrics_mode=" << static_cast<int>(app.lyricsMode) << "\n"
       << "prefetch=" << app.prefetchMode << "\n"
       << "lcd=" << (app.lcd.enabled() ? 1 : 0) << "\n"
@@ -1827,6 +1902,8 @@ void loadSettings(AppState &app) {
     if (mode >= 0 && mode <= 2)
       app.repeat = static_cast<RepeatMode>(mode);
   }
+  if (values.count("resume"))
+    app.resumeMode = std::clamp(std::atoi(values["resume"].c_str()), 0, 2);
   if (values.count("lyrics_mode")) {
     const int mode = std::atoi(values["lyrics_mode"].c_str());
     if (mode >= 0 && mode <= 2)
@@ -1867,6 +1944,9 @@ void changeSetting(AppState &app, int item, int dir) {
   case SetRepeat:
     app.repeat = static_cast<RepeatMode>(
         cycleIndex(static_cast<int>(app.repeat), dir, 3));
+    break;
+  case SetResume:
+    app.resumeMode = cycleIndex(app.resumeMode, dir, 3);
     break;
   case SetLyrics:
     app.lyricsMode = static_cast<LyricsMode>(
@@ -1970,6 +2050,10 @@ std::string settingValue(const AppState &app, int item) {
     return app.repeat == RepeatMode::Off   ? "Off"
            : app.repeat == RepeatMode::All ? "All songs"
                                            : "One song";
+  case SetResume:
+    return app.resumeMode == 0   ? "Nothing (start empty)"
+           : app.resumeMode == 1 ? "Last song, paused"
+                                 : "Last song, playing";
   case SetLyrics:
     return app.lyricsMode == LyricsMode::Off     ? "Off"
            : app.lyricsMode == LyricsMode::Right ? "Right of the player"
@@ -2023,11 +2107,11 @@ std::string settingValue(const AppState &app, int item) {
 
 void drawSettings(const AppState &app) {
   static const char *const labels[kSettingCount] = {
-      "Repeat",          "Lyrics panel",      "Prepare lyrics", "LCD display",
-      "LCD Japanese",    "Album art",         "Visualizer",     "Layout",
-      "Control buttons", "Notifications",     "Theme",          "Custom: title",
-      "Custom: accent",  "Custom: highlight", "Custom: bars",   "Font size",
-      "Music folder"};
+      "Repeat",        "On start",        "Lyrics panel",      "Prepare lyrics",
+      "LCD display",   "LCD Japanese",    "Album art",         "Visualizer",
+      "Layout",        "Control buttons", "Notifications",     "Theme",
+      "Custom: title", "Custom: accent",  "Custom: highlight", "Custom: bars",
+      "Font size",     "Music folder"};
   std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
   const std::size_t selected = app.settingsCursor.current();
 
@@ -3113,6 +3197,7 @@ int run() {
   fs::create_directories(configDirectory, ec);
   const fs::path queueFile = configDirectory / "queue.txt";
   app.statsFile = configDirectory / "stats.txt";
+  app.lastFile = configDirectory / "last.txt";
 
   app.songQueue.load(queueFile.string());
   loadStats(app);
@@ -3137,6 +3222,9 @@ int run() {
       !(mp && std::string(mp) == "0"))
     app.mpris.start(); // media keys, playerctl, desktop media widget
 
+  if (app.resumeMode != 0)
+    resumeLastPlayed(app);
+
   installSignalHandlers();
   TerminalSession terminal;
   bool running = true;
@@ -3159,10 +3247,12 @@ int run() {
     if (statsSaveAccumulator >= 5.0) {
       if (app.statsDirty)
         saveStats(app);
-      saveSettings(
-          app); // picks up changes made with the hot keys (L, A, T, i, v)
+      saveSettings(app); // picks up changes made with the hot keys (L, T, i, v)
+      saveLastPlayed(app);
       statsSaveAccumulator = 0.0;
     }
+    if (app.hasCurrentSong && app.currentSong != app.lastSavedSong)
+      saveLastPlayed(app); // a new song started
 
     updateLyricsRequest(app); // start a lyrics lookup when the song changed
     syncLyricShift(app);
@@ -3188,6 +3278,7 @@ int run() {
     }
   }
 
+  saveLastPlayed(app); // before stopping, so the position is still known
   app.player.stop();
   app.songQueue.save(queueFile.string());
   saveStats(app);

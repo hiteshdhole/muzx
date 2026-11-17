@@ -87,7 +87,9 @@ Turn the mouse off with `MUZX_MOUSE=0`.
 Move with `j`/`k`, change with `Enter` or `←`/`→` (or click). Saved in
 `~/.config/muzx/settings.conf`.
 
-Repeat, lyrics panel position,
+Repeat, **on start** (continue with the last song: not at all / paused /
+playing, from where it stopped; remembered in `~/.config/muzx/last.txt`),
+lyrics panel position,
 prepare lyrics (background queue, see below), LCD
 on/off and Japanese mode, album art, visualizer, layout (normal or compact),
 control buttons, notifications, theme (Purple, Ocean, Forest, Sunset, Mono,
