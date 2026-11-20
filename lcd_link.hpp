@@ -858,6 +858,40 @@ public:
   // Returns false when muzxlcd is not running.
   bool command(const std::string &cmd) { return sendRaw(cmd) >= 0; }
 
+  // Asks muzxlcd something and waits a moment for the answer ("status", "set
+  // volume 1" ...).
+  bool query(const std::string &cmd, std::string &reply,
+             int timeoutMs = 400) const {
+    const int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+      return false;
+    sockaddr_un me{};
+    me.sun_family = AF_UNIX;
+    ::bind(fd, reinterpret_cast<sockaddr *>(&me),
+           sizeof(sa_family_t)); // automatic address for the answer
+    sockaddr_un to{};
+    to.sun_family = AF_UNIX;
+    const std::string path = daemonSocketPath();
+    bool ok = false;
+    if (path.size() < sizeof(to.sun_path)) {
+      std::copy(path.begin(), path.end(), to.sun_path);
+      if (::sendto(fd, cmd.data(), cmd.size(), 0,
+                   reinterpret_cast<sockaddr *>(&to), sizeof(to)) >= 0) {
+        pollfd pfd{fd, POLLIN, 0};
+        if (::poll(&pfd, 1, timeoutMs) > 0) {
+          char buf[2048];
+          const ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+          if (n >= 0) {
+            reply.assign(buf, static_cast<std::size_t>(n));
+            ok = true;
+          }
+        }
+      }
+    }
+    ::close(fd);
+    return ok;
+  }
+
   // True while the lines go through the muzxlcd program.
   bool viaHub() const { return viaDaemon_; }
 

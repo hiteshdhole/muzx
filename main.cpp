@@ -1812,6 +1812,15 @@ enum SettingItem {
   SetPrefetch, // lyrics
   SetLcd,
   SetLcdKana, // LCD
+  SetHubMode,
+  SetHubVolume,
+  SetHubNotify, // LCD hub
+  SetHubLyrics,
+  SetHubCaptions,
+  SetHubNowPlaying,
+  SetHubSpectrum,
+  SetHubClock,
+  SetHubStatus,
   SetArt,
   SetVisualizer,
   SetLayout,
@@ -1826,6 +1835,64 @@ enum SettingItem {
   SetFolder, // general
   kSettingCount
 };
+
+// What the LCD hub (muzxlcd) says about itself. It keeps these settings in its
+// own file (lcd.conf); MUZX only asks and sends commands.
+struct HubInfo {
+  bool running = false;
+  std::string mode;
+  std::vector<std::string> modes;
+  bool volume = true, notify = true;
+  std::chrono::steady_clock::time_point asked{};
+};
+HubInfo g_hub;
+const char *const kHubModeNames[] = {"lyrics",   "captions", "nowplaying",
+                                     "spectrum", "clock",    "status"};
+
+std::vector<std::string> splitCommas(const std::string &s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ',') {
+      if (!cur.empty())
+        out.push_back(cur);
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  if (!cur.empty())
+    out.push_back(cur);
+  return out;
+}
+
+// Asks the hub for its state (at most every 2 seconds unless forced).
+void refreshHub(const AppState &app, bool force = false) {
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && now - g_hub.asked < std::chrono::seconds(2))
+    return;
+  g_hub.asked = now;
+  std::string reply;
+  g_hub.running = app.lcd.query("status", reply, 150);
+  if (!g_hub.running)
+    return;
+  std::istringstream in(reply.substr(0, reply.find(" lcd=")));
+  std::string token;
+  while (in >> token) {
+    const std::size_t eq = token.find('=');
+    if (eq == std::string::npos)
+      continue;
+    const std::string k = token.substr(0, eq), v = token.substr(eq + 1);
+    if (k == "mode")
+      g_hub.mode = v;
+    else if (k == "modes")
+      g_hub.modes = splitCommas(v);
+    else if (k == "volume")
+      g_hub.volume = v == "1";
+    else if (k == "notify")
+      g_hub.notify = v == "1";
+  }
+}
 
 const int kFontChoices[] = {0, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28};
 
@@ -1962,6 +2029,51 @@ void changeSetting(AppState &app, int item, int dir) {
   case SetLcdKana:
     app.lcd.setKana(!app.lcd.kana());
     break;
+  case SetHubMode:
+  case SetHubVolume:
+  case SetHubNotify:
+  case SetHubLyrics:
+  case SetHubCaptions:
+  case SetHubNowPlaying:
+  case SetHubSpectrum:
+  case SetHubClock:
+  case SetHubStatus: {
+    refreshHub(app, true);
+    std::string reply;
+    if (!g_hub.running) {
+      app.settingsNote =
+          "The LCD hub is not running (start it with: muzxlcd &)";
+      break;
+    }
+    if (item == SetHubMode) {
+      app.lcd.query(dir > 0 ? "mode next" : "mode prev", reply);
+    } else if (item == SetHubVolume) {
+      app.lcd.query(std::string("set volume ") + (g_hub.volume ? "0" : "1"),
+                    reply);
+    } else if (item == SetHubNotify) {
+      app.lcd.query(std::string("set notify ") + (g_hub.notify ? "0" : "1"),
+                    reply);
+    } else {
+      const std::string name = kHubModeNames[item - SetHubLyrics];
+      std::vector<std::string> modes;
+      for (const char *m : kHubModeNames) { // keep the usual order
+        const bool has = std::find(g_hub.modes.begin(), g_hub.modes.end(), m) !=
+                         g_hub.modes.end();
+        if (m == name ? !has : has)
+          modes.push_back(m);
+      }
+      if (modes.empty()) {
+        app.settingsNote = "At least one LCD mode has to stay on";
+        break;
+      }
+      std::string list;
+      for (const std::string &m : modes)
+        list += (list.empty() ? "" : ",") + m;
+      app.lcd.query("set modes " + list, reply);
+    }
+    refreshHub(app, true);
+    break;
+  }
   case SetArt:
     app.showAlbumArt = !app.showAlbumArt;
     break;
@@ -2075,6 +2187,25 @@ std::string settingValue(const AppState &app, int item) {
                                : "On (waiting for the Arduino)";
   case SetLcdKana:
     return app.lcd.kana() ? "Katakana (Japanese ROM)" : "Romaji (any LCD)";
+  case SetHubMode:
+    refreshHub(app);
+    return g_hub.running ? "Showing: " + g_hub.mode + "   (Enter = next)"
+                         : "hub not running";
+  case SetHubVolume:
+    return g_hub.running ? onOff(g_hub.volume) : "hub not running";
+  case SetHubNotify:
+    return g_hub.running ? onOff(g_hub.notify) : "hub not running";
+  case SetHubLyrics:
+  case SetHubCaptions:
+  case SetHubNowPlaying:
+  case SetHubSpectrum:
+  case SetHubClock:
+  case SetHubStatus:
+    return g_hub.running
+               ? onOff(std::find(g_hub.modes.begin(), g_hub.modes.end(),
+                                 kHubModeNames[item - SetHubLyrics]) !=
+                       g_hub.modes.end())
+               : "hub not running";
   case SetArt:
     return onOff(app.showAlbumArt);
   case SetVisualizer:
@@ -2106,12 +2237,33 @@ std::string settingValue(const AppState &app, int item) {
 }
 
 void drawSettings(const AppState &app) {
-  static const char *const labels[kSettingCount] = {
-      "Repeat",        "On start",        "Lyrics panel",      "Prepare lyrics",
-      "LCD display",   "LCD Japanese",    "Album art",         "Visualizer",
-      "Layout",        "Control buttons", "Notifications",     "Theme",
-      "Custom: title", "Custom: accent",  "Custom: highlight", "Custom: bars",
-      "Font size",     "Music folder"};
+  static const char *const labels[kSettingCount] = {"Repeat",
+                                                    "On start",
+                                                    "Lyrics panel",
+                                                    "Prepare lyrics",
+                                                    "LCD display",
+                                                    "LCD Japanese",
+                                                    "Hub: show now",
+                                                    "Hub: volume popup",
+                                                    "Hub: notifications",
+                                                    "Hub mode: lyrics",
+                                                    "Hub mode: captions",
+                                                    "Hub mode: playing",
+                                                    "Hub mode: spectrum",
+                                                    "Hub mode: clock",
+                                                    "Hub mode: status",
+                                                    "Album art",
+                                                    "Visualizer",
+                                                    "Layout",
+                                                    "Control buttons",
+                                                    "Notifications",
+                                                    "Theme",
+                                                    "Custom: title",
+                                                    "Custom: accent",
+                                                    "Custom: highlight",
+                                                    "Custom: bars",
+                                                    "Font size",
+                                                    "Music folder"};
   std::cout << kPurpleBold << "SETTINGS" << kReset << "\n";
   const std::size_t selected = app.settingsCursor.current();
 
@@ -2134,6 +2286,8 @@ void drawSettings(const AppState &app) {
       heading("LYRICS");
     else if (i == SetLcd)
       heading("LCD (Arduino)");
+    else if (i == SetHubMode)
+      heading("LCD HUB (muzxlcd program)");
     else if (i == SetArt)
       heading("DISPLAY");
     else if (i == SetTheme)

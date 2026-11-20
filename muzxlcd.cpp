@@ -22,9 +22,11 @@
 //   language for yt-dlp page_seconds=3                                    how
 //   long each status page stays kana=0 1 = Japanese as katakana
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +47,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -194,16 +197,21 @@ static std::string runProgram(const std::vector<std::string> &args, bool &ok,
 // ===========================================================================
 struct Config {
   int cols = 16;
-  std::vector<std::string> modes{"lyrics", "captions", "nowplaying", "clock",
-                                 "status"};
+  std::vector<std::string> modes{"lyrics",   "captions", "nowplaying",
+                                 "spectrum", "clock",    "status"};
   std::string port;
   std::string captionsLang = "en";
   double pageSeconds = 3.0;
   bool kana = false;
+  bool volumePopup = true;   // a volume bar appears when the volume changes
+  bool notifications = true; // desktop notifications appear for a few seconds
+  double notifySeconds = 6.0;
+  std::string spectrumSource =
+      "@DEFAULT_MONITOR@"; // what parec records for the spectrum
 };
 
 static const std::vector<std::string> kAllModes{
-    "lyrics", "captions", "nowplaying", "clock", "status"};
+    "lyrics", "captions", "nowplaying", "spectrum", "clock", "status"};
 
 static std::string modeTitle(const std::string &m) {
   if (m == "lyrics")
@@ -212,6 +220,8 @@ static std::string modeTitle(const std::string &m) {
     return "Captions";
   if (m == "nowplaying")
     return "Now playing";
+  if (m == "spectrum")
+    return "Spectrum";
   if (m == "clock")
     return "Clock";
   if (m == "status")
@@ -253,6 +263,14 @@ static Config loadConfig() {
       c.pageSeconds = std::clamp(std::atof(v.c_str()), 1.0, 30.0);
     } else if (k == "kana") {
       c.kana = v == "1" || v == "true";
+    } else if (k == "volume_popup") {
+      c.volumePopup = v == "1" || v == "true";
+    } else if (k == "notifications") {
+      c.notifications = v == "1" || v == "true";
+    } else if (k == "notify_seconds") {
+      c.notifySeconds = std::clamp(std::atof(v.c_str()), 2.0, 30.0);
+    } else if (k == "spectrum_source" && !v.empty()) {
+      c.spectrumSource = v;
     }
   }
   if (const char *p = std::getenv("MUZX_LCD_PORT"); p && *p)
@@ -262,6 +280,43 @@ static Config loadConfig() {
   if (const char *cols = std::getenv("MUZX_LCD_COLS"); cols && *cols)
     c.cols = std::clamp(std::atoi(cols), 8, 40);
   return c;
+}
+
+// Changes one `key=value` line of lcd.conf (adds it when missing) and keeps the
+// rest of the file as it is.
+static void saveConfigKey(const std::string &key, const std::string &value) {
+  std::error_code ec;
+  fs::create_directories(configDir(), ec);
+  const fs::path path = configDir() / "lcd.conf";
+  std::vector<std::string> lines;
+  bool replaced = false;
+  {
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+      const std::string t = trim(line);
+      const std::size_t eq = t.find('=');
+      if (!replaced && !t.empty() && t[0] != '#' && eq != std::string::npos &&
+          trim(t.substr(0, eq)) == key) {
+        lines.push_back(key + "=" + value);
+        replaced = true;
+      } else {
+        lines.push_back(line);
+      }
+    }
+  }
+  if (!replaced)
+    lines.push_back(key + "=" + value);
+  fs::path tmp = path;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    for (const std::string &l : lines)
+      out << l << "\n";
+    if (!out)
+      return;
+  }
+  fs::rename(tmp, path, ec);
 }
 
 // ===========================================================================
@@ -624,6 +679,7 @@ struct PlayerInfo {
   std::string title, artist, url;
   double lengthSec = 0;
   double posSec = 0;
+  double volume = -1; // 0..1 (the player's own volume), -1 unknown
   Clock::time_point sampled{};
 
   bool playing() const { return status == "Playing"; }
@@ -694,7 +750,7 @@ private:
         std::lock_guard<std::mutex> lock(mu_);
         players_ = std::move(found);
       }
-      sleepMs(1000);
+      sleepMs(400);
     }
     if (bus)
       sd_bus_flush_close_unref(bus);
@@ -716,6 +772,14 @@ private:
         status)
       p.status = status;
     free(status);
+    sd_bus_error_free(&err);
+    err = SD_BUS_ERROR_NULL;
+
+    double vol = 0;
+    if (sd_bus_get_property_trivial(bus, name, kPath, kIface, "Volume", &err,
+                                    'd', &vol) >= 0 &&
+        std::isfinite(vol))
+      p.volume = vol;
     sd_bus_error_free(&err);
     err = SD_BUS_ERROR_NULL;
 
@@ -1246,6 +1310,432 @@ static std::string fmtRate(double bytes) {
 }
 
 // ===========================================================================
+// helper programs that run in the background (pactl, busctl, parec)
+// ===========================================================================
+struct ChildProcess {
+  pid_t pid = -1;
+  int fd = -1; // its stdout
+
+  bool start(const std::vector<std::string> &args) {
+    int p[2];
+    if (pipe2(p, O_CLOEXEC) != 0)
+      return false;
+    const pid_t child = fork();
+    if (child < 0) {
+      close(p[0]);
+      close(p[1]);
+      return false;
+    }
+    if (child == 0) {
+      prctl(PR_SET_PDEATHSIG, SIGKILL); // never outlive the hub
+      dup2(p[1], 1);
+      const int devnull = open("/dev/null", O_RDWR);
+      if (devnull >= 0) {
+        dup2(devnull, 0);
+        dup2(devnull, 2);
+      }
+      std::vector<char *> argv;
+      for (const std::string &a : args)
+        argv.push_back(const_cast<char *>(a.c_str()));
+      argv.push_back(nullptr);
+      execvp(argv[0], argv.data());
+      _exit(127);
+    }
+    close(p[1]);
+    fd = p[0];
+    pid = child;
+    return true;
+  }
+
+  // Exit code when the program has ended, -1 while it still runs.
+  int exitCode() {
+    if (pid <= 0)
+      return -1;
+    int status = 0;
+    const pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == 0)
+      return -1;
+    pid = -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+  }
+
+  void stop() {
+    if (pid > 0) {
+      kill(pid, SIGKILL);
+      int status = 0;
+      waitpid(pid, &status, 0);
+      pid = -1;
+    }
+    if (fd >= 0)
+      close(fd);
+    fd = -1;
+  }
+};
+
+// Sleeps in small steps so a stop request is noticed quickly.
+static void sleepUnless(const std::atomic<bool> &stop, int ms) {
+  for (int i = 0; i < ms / 50 && !stop; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+// ---------------------------------------------------------------------------
+// System volume (PipeWire / PulseAudio through pactl): a change makes the
+// volume bar pop up.
+// ---------------------------------------------------------------------------
+class VolumeWatcher {
+public:
+  struct State {
+    int percent = -1;
+    bool muted = false;
+    unsigned serial = 0; // goes up with every change
+  };
+
+  VolumeWatcher() {
+    worker_ = std::thread([this] { loop(); });
+  }
+  ~VolumeWatcher() {
+    stop_ = true;
+    if (worker_.joinable())
+      worker_.join();
+  }
+  State state() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return state_;
+  }
+
+private:
+  void loop() {
+    while (!stop_) {
+      readVolume(true); // where we start: no popup for that
+      ChildProcess child;
+      if (!child.start({"pactl", "subscribe"})) {
+        sleepUnless(stop_, 10000);
+        continue;
+      }
+      std::string buf;
+      while (!stop_) {
+        pollfd pfd{child.fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 300) <= 0)
+          continue;
+        char tmp[1024];
+        const ssize_t n = ::read(child.fd, tmp, sizeof(tmp));
+        if (n <= 0)
+          break;
+        buf.append(tmp, static_cast<std::size_t>(n));
+        bool changed = false;
+        std::size_t nl;
+        while ((nl = buf.find('\n')) != std::string::npos) {
+          const std::string line = buf.substr(0, nl);
+          buf.erase(0, nl + 1);
+          if (line.find("'change'") != std::string::npos &&
+              (line.find(" sink ") != std::string::npos ||
+               line.find(" server") != std::string::npos))
+            changed = true;
+        }
+        if (buf.size() > 4096)
+          buf.clear();
+        if (changed)
+          readVolume(false);
+      }
+      const bool missing = child.exitCode() == 127;
+      child.stop();
+      if (!stop_)
+        sleepUnless(stop_,
+                    missing ? 60000
+                            : 5000); // pactl not installed: do not keep trying
+    }
+  }
+
+  void readVolume(bool baseline) {
+    bool ok = false;
+    const std::string vol =
+        runProgram({"pactl", "get-sink-volume", "@DEFAULT_SINK@"}, ok);
+    if (!ok)
+      return;
+    int percent = -1;
+    const std::size_t pct = vol.find('%');
+    if (pct != std::string::npos) {
+      std::size_t b = pct;
+      while (b > 0 && std::isdigit(static_cast<unsigned char>(vol[b - 1])))
+        --b;
+      if (b < pct)
+        percent = std::atoi(vol.substr(b, pct - b).c_str());
+    }
+    bool mok = false;
+    const std::string mute =
+        runProgram({"pactl", "get-sink-mute", "@DEFAULT_SINK@"}, mok);
+    const bool muted = mok && mute.find("yes") != std::string::npos;
+    if (percent < 0)
+      return;
+    std::lock_guard<std::mutex> lock(mu_);
+    const bool changed = percent != state_.percent || muted != state_.muted;
+    const bool hadBaseline = state_.percent >= 0;
+    state_.percent = percent;
+    state_.muted = muted;
+    if (changed && !baseline && hadBaseline)
+      ++state_.serial;
+  }
+
+  mutable std::mutex mu_;
+  State state_;
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+};
+
+// ---------------------------------------------------------------------------
+// Desktop notifications: `busctl monitor` watches the Notify calls (works with
+// dunst, mako, KDE, GNOME ...). Nothing is read except the text of the message.
+// ---------------------------------------------------------------------------
+struct Notification {
+  std::string app, summary, body;
+};
+
+class NotificationWatcher {
+public:
+  NotificationWatcher() {
+    worker_ = std::thread([this] { loop(); });
+  }
+  ~NotificationWatcher() {
+    stop_ = true;
+    if (worker_.joinable())
+      worker_.join();
+  }
+  std::vector<Notification> take() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<Notification> out;
+    out.swap(pending_);
+    return out;
+  }
+
+private:
+  void loop() {
+    while (!stop_) {
+      ChildProcess child;
+      if (!child.start({"busctl", "--user", "--json=short", "monitor",
+                        "org.freedesktop.Notifications"})) {
+        sleepUnless(stop_, 10000);
+        continue;
+      }
+      std::string buf;
+      while (!stop_) {
+        pollfd pfd{child.fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 300) <= 0)
+          continue;
+        char tmp[4096];
+        const ssize_t n = ::read(child.fd, tmp, sizeof(tmp));
+        if (n <= 0)
+          break;
+        buf.append(tmp, static_cast<std::size_t>(n));
+        std::size_t nl;
+        while ((nl = buf.find('\n')) != std::string::npos) {
+          handleLine(buf.substr(0, nl));
+          buf.erase(0, nl + 1);
+        }
+        if (buf.size() > 65536)
+          buf.clear();
+      }
+      const bool missing = child.exitCode() == 127;
+      child.stop();
+      // busctl stops when no notification program is running yet: try again
+      if (!stop_)
+        sleepUnless(stop_, missing ? 60000 : 8000);
+    }
+  }
+
+  void handleLine(const std::string &line) {
+    const auto j = parseJson(line);
+    if (!j || j->type != Json::Obj || j->getStr("member") != "Notify" ||
+        j->getStr("type") != "method_call")
+      return;
+    const Json *payload = j->get("payload");
+    const Json *data = payload ? payload->get("data") : nullptr;
+    if (!data || data->type != Json::Arr || data->arr.size() < 5)
+      return;
+    Notification n;
+    if (data->arr[0].type == Json::Str)
+      n.app = data->arr[0].str;
+    if (data->arr[3].type == Json::Str)
+      n.summary = data->arr[3].str;
+    if (data->arr[4].type == Json::Str)
+      n.body = data->arr[4].str;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (pending_.size() < 8)
+      pending_.push_back(std::move(n));
+  }
+
+  std::mutex mu_;
+  std::vector<Notification> pending_;
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+};
+
+// ---------------------------------------------------------------------------
+// Spectrum: records what the computer plays (parec, from PipeWire or
+// PulseAudio) and turns it into one bar per LCD column. It only records while
+// the spectrum mode is on screen.
+// ---------------------------------------------------------------------------
+static void fftInPlace(std::vector<std::complex<float>> &a) {
+  const std::size_t n = a.size();
+  for (std::size_t i = 1, j = 0; i < n; ++i) { // bit reversal
+    std::size_t bit = n >> 1;
+    for (; j & bit; bit >>= 1)
+      j ^= bit;
+    j ^= bit;
+    if (i < j)
+      std::swap(a[i], a[j]);
+  }
+  for (std::size_t len = 2; len <= n; len <<= 1) {
+    const float ang = -2.0F * 3.14159265358979F / static_cast<float>(len);
+    const std::complex<float> wlen(std::cos(ang), std::sin(ang));
+    for (std::size_t i = 0; i < n; i += len) {
+      std::complex<float> w(1.0F, 0.0F);
+      for (std::size_t k = 0; k < len / 2; ++k) {
+        const std::complex<float> u = a[i + k], v = a[i + k + len / 2] * w;
+        a[i + k] = u + v;
+        a[i + k + len / 2] = u - v;
+        w *= wlen;
+      }
+    }
+  }
+}
+
+class SpectrumTap {
+public:
+  enum class Status { Idle, Running, NoTool };
+
+  SpectrumTap(std::string source, int bands)
+      : source_(std::move(source)), bands_(std::max(4, bands)),
+        levels_(static_cast<std::size_t>(std::max(4, bands)), 0.0F) {
+    worker_ = std::thread([this] { loop(); });
+  }
+  ~SpectrumTap() {
+    stop_ = true;
+    if (worker_.joinable())
+      worker_.join();
+  }
+  void setWanted(bool wanted) { wanted_ = wanted; }
+  Status status() const { return status_; }
+  std::vector<float> levels() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return levels_;
+  }
+
+private:
+  static constexpr int kRate = 16000;
+  static constexpr std::size_t kWindow = 512;
+
+  void loop() {
+    while (!stop_) {
+      if (!wanted_) {
+        status_ = Status::Idle;
+        setLevels(std::vector<float>(static_cast<std::size_t>(bands_), 0.0F));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
+      ChildProcess child;
+      if (!child.start({"parec", "-d", source_, "--format=s16le",
+                        "--rate=" + std::to_string(kRate), "--channels=1",
+                        "--latency-msec=30"})) {
+        sleepUnless(stop_, 3000);
+        continue;
+      }
+      status_ = Status::Running;
+      std::vector<std::int16_t> samples;
+      std::string pending;
+      std::size_t sinceLast = 0;
+      while (!stop_ && wanted_) {
+        pollfd pfd{child.fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 200) <= 0)
+          continue;
+        char tmp[4096];
+        const ssize_t n = ::read(child.fd, tmp, sizeof(tmp));
+        if (n <= 0)
+          break;
+        pending.append(tmp, static_cast<std::size_t>(n));
+        const std::size_t whole = pending.size() / 2;
+        for (std::size_t i = 0; i < whole; ++i) {
+          std::int16_t v;
+          std::memcpy(&v, pending.data() + i * 2, 2);
+          samples.push_back(v);
+        }
+        pending.erase(0, whole * 2);
+        sinceLast += whole;
+        if (samples.size() > kWindow * 4)
+          samples.erase(samples.begin(),
+                        samples.end() - static_cast<std::ptrdiff_t>(kWindow));
+        if (samples.size() >= kWindow && sinceLast >= 256) {
+          sinceLast = 0;
+          analyse(samples);
+        }
+      }
+      const int code = child.exitCode();
+      child.stop();
+      if (code == 127) {
+        status_ = Status::NoTool;
+        sleepUnless(stop_, 10000);
+      } else if (!stop_ && wanted_) {
+        sleepUnless(stop_, 2000); // the sound server was restarted, ...
+      }
+    }
+  }
+
+  void analyse(const std::vector<std::int16_t> &samples) {
+    std::vector<std::complex<float>> buf(kWindow);
+    const std::size_t off = samples.size() - kWindow;
+    for (std::size_t i = 0; i < kWindow; ++i) {
+      const float hann =
+          0.5F - 0.5F * std::cos(2.0F * 3.14159265F * static_cast<float>(i) /
+                                 static_cast<float>(kWindow - 1));
+      buf[i] = std::complex<float>(static_cast<float>(samples[off + i]) * hann,
+                                   0.0F);
+    }
+    fftInPlace(buf);
+    const float binHz = static_cast<float>(kRate) / static_cast<float>(kWindow);
+    const float fullScaleDb =
+        20.0F * std::log10(32768.0F * static_cast<float>(kWindow) / 4.0F);
+    std::vector<float> now(static_cast<std::size_t>(bands_), 0.0F);
+    const float lowHz = 60.0F, highHz = 7500.0F;
+    for (int b = 0; b < bands_; ++b) {
+      const float f0 =
+          lowHz * std::pow(highHz / lowHz,
+                           static_cast<float>(b) / static_cast<float>(bands_));
+      const float f1 =
+          lowHz * std::pow(highHz / lowHz, static_cast<float>(b + 1) /
+                                               static_cast<float>(bands_));
+      std::size_t i0 = static_cast<std::size_t>(std::lround(f0 / binHz));
+      std::size_t i1 = static_cast<std::size_t>(std::lround(f1 / binHz));
+      i0 = std::clamp<std::size_t>(i0, 1, kWindow / 2 - 1);
+      i1 = std::clamp<std::size_t>(std::max(i1, i0 + 1), 2, kWindow / 2);
+      float mag = 0.0F;
+      for (std::size_t i = i0; i < i1; ++i)
+        mag = std::max(mag, std::abs(buf[i]));
+      const float db = 20.0F * std::log10(mag + 1e-6F) - fullScaleDb;
+      const float tilt = 8.0F * static_cast<float>(b) /
+                         static_cast<float>(bands_); // highs are quieter
+      now[static_cast<std::size_t>(b)] =
+          std::clamp((db + tilt + 70.0F) / 55.0F, 0.0F, 1.0F);
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    for (std::size_t b = 0; b < levels_.size(); ++b) // quick up, slow down
+      levels_[b] = std::max(now[b], levels_[b] - 0.05F);
+  }
+
+  void setLevels(const std::vector<float> &v) {
+    std::lock_guard<std::mutex> lock(mu_);
+    levels_ = v;
+  }
+
+  std::string source_;
+  int bands_;
+  mutable std::mutex mu_;
+  std::vector<float> levels_;
+  std::atomic<bool> wanted_{false};
+  std::atomic<bool> stop_{false};
+  std::atomic<Status> status_{Status::Idle};
+  std::thread worker_;
+};
+
+// ===========================================================================
 // the LCD: serial port + frames
 // ===========================================================================
 struct Frame {
@@ -1437,7 +1927,8 @@ static void onSignal(int) { g_quit = true; }
 
 class Hub {
 public:
-  Hub(const Config &cfg) : cfg_(cfg), lcd_(cfg) {
+  Hub(const Config &cfg)
+      : cfg_(cfg), lcd_(cfg), spectrum_(cfg.spectrumSource, cfg.cols) {
     const std::string saved = trim(readFile(configDir() / "lcd.state"));
     for (std::size_t i = 0; i < cfg_.modes.size(); ++i)
       if (cfg_.modes[i] == saved)
@@ -1458,10 +1949,12 @@ public:
 
     while (!g_quit) {
       lcd_.maintain();
+      const bool spectrumOn = cfg_.modes[mode_] == "spectrum";
+      spectrum_.setWanted(spectrumOn); // only record sound while it is shown
       pollfd pfds[2];
       pfds[0] = {sock, POLLIN, 0};
       pfds[1] = {lcd_.fd(), POLLIN, 0};
-      ::poll(pfds, lcd_.fd() >= 0 ? 2 : 1, 100);
+      ::poll(pfds, lcd_.fd() >= 0 ? 2 : 1, spectrumOn ? 70 : 100);
       handleSocket(sock);
       for (char c : lcd_.readButtons())
         step(c == 'L' ? -1 : 1);
@@ -1565,15 +2058,53 @@ private:
     if (cmd == "modes")
       return join(cfg_.modes);
     if (cmd == "status") {
+      // key=value pairs; "lcd=" is last because its value can contain spaces
       return "mode=" + cfg_.modes[mode_] + " modes=" + join(cfg_.modes) +
-             " lcd=" +
+             " all=" + join(kAllModes) +
+             " volume=" + (cfg_.volumePopup ? "1" : "0") +
+             " notify=" + (cfg_.notifications ? "1" : "0") + " lcd=" +
              (lcd_.connected() ? lcd_.port() : std::string("not connected"));
+    }
+    if (cmd == "set") { // set modes a,b,c | set volume 0/1 | set notify 0/1
+                        // (saved in lcd.conf)
+      const std::size_t sp2 = arg.find(' ');
+      const std::string what = lower(arg.substr(0, sp2));
+      const std::string value =
+          sp2 == std::string::npos ? "" : trim(arg.substr(sp2 + 1));
+      if (what == "volume" || what == "notify") {
+        const bool on = value == "1" || lower(value) == "on";
+        (what == "volume" ? cfg_.volumePopup : cfg_.notifications) = on;
+        saveConfigKey(what == "volume" ? "volume_popup" : "notifications",
+                      on ? "1" : "0");
+        return "ok";
+      }
+      if (what == "modes") {
+        std::vector<std::string> modes;
+        for (const std::string &m : split(value, ',')) {
+          const std::string name = lower(trim(m));
+          if (std::find(kAllModes.begin(), kAllModes.end(), name) !=
+                  kAllModes.end() &&
+              std::find(modes.begin(), modes.end(), name) == modes.end())
+            modes.push_back(name);
+        }
+        if (modes.empty())
+          return "need at least one mode";
+        const std::string current = cfg_.modes[mode_];
+        cfg_.modes = modes;
+        mode_ = 0;
+        for (std::size_t i = 0; i < cfg_.modes.size(); ++i)
+          if (cfg_.modes[i] == current)
+            mode_ = i;
+        saveConfigKey("modes", join(cfg_.modes));
+        return "ok";
+      }
+      return "unknown setting (modes, volume, notify)";
     }
     if (cmd == "quit") {
       g_quit = true;
       return "bye";
     }
-    return "unknown command (mode, modes, status, quit)";
+    return "unknown command (mode, modes, set, status, quit)";
   }
 
   static std::string join(const std::vector<std::string> &v) {
@@ -1662,6 +2193,16 @@ private:
                        center(modeTitle(mode), cols));
     const std::vector<PlayerInfo> ps = mpris_.players();
 
+    // Popups come first: a notification for a few seconds, a volume bar for
+    // two.
+    updatePopups(ps, now);
+    if (now < noteUntil_)
+      return textFrame(noteText_);
+    if (now < volumeUntil_)
+      return volumeFrame();
+
+    if (mode == "spectrum")
+      return spectrumFrame();
     if (mode == "clock") {
       const std::time_t t = std::time(nullptr);
       std::tm tm{};
@@ -1693,6 +2234,93 @@ private:
     if (mode == "captions")
       return captionsFrame(ps, now);
     return lyricsFrame(ps, now);
+  }
+
+  // ---- popups
+  // ----------------------------------------------------------------
+  static std::string cutUtf8(const std::string &s, std::size_t maxBytes) {
+    if (s.size() <= maxBytes)
+      return s;
+    std::size_t n = maxBytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80)
+      --n; // do not cut a character in half
+    return s.substr(0, n);
+  }
+
+  void updatePopups(const std::vector<PlayerInfo> &ps, Clock::time_point now) {
+    // desktop notifications
+    for (const Notification &n : notes_.take()) {
+      if (!cfg_.notifications || lower(n.app) == "muzx")
+        continue; // MUZX's own "now playing" messages would only repeat the
+                  // screen
+      std::string text = stripVttTags(n.summary);
+      const std::string body = stripVttTags(n.body);
+      if (!body.empty())
+        text += (text.empty() ? "" : ": ") + body;
+      for (char &c : text)
+        if (c == '\n' || c == '\r' || static_cast<unsigned char>(c) < 32)
+          c = ' ';
+      noteText_ = cutUtf8(text, 100);
+      noteUntil_ = now + std::chrono::milliseconds(
+                             static_cast<long>(cfg_.notifySeconds * 1000));
+    }
+    // volume of the computer (pactl) ...
+    const VolumeWatcher::State vs = volume_.state();
+    if (vs.serial != seenVolumeSerial_) {
+      seenVolumeSerial_ = vs.serial;
+      volumePercent_ = vs.percent;
+      volumeMuted_ = vs.muted;
+      if (cfg_.volumePopup)
+        volumeUntil_ = now + std::chrono::milliseconds(1800);
+    }
+    // ... and of the player (MUZX, Spotify): its own volume property
+    for (const PlayerInfo &p : ps) {
+      if (p.volume < 0)
+        continue;
+      const auto it = playerVolume_.find(p.bus);
+      if (it == playerVolume_.end()) {
+        playerVolume_[p.bus] = p.volume; // first sight: no popup
+      } else if (std::fabs(it->second - p.volume) > 0.004) {
+        it->second = p.volume;
+        volumePercent_ = static_cast<int>(std::lround(p.volume * 100.0));
+        volumeMuted_ = false;
+        if (cfg_.volumePopup)
+          volumeUntil_ = now + std::chrono::milliseconds(1800);
+      }
+    }
+  }
+
+  Frame volumeFrame() const {
+    const int cols = cfg_.cols;
+    const int pct = std::clamp(volumePercent_, 0, 150);
+    const std::string title =
+        volumeMuted_ ? "Volume muted" : "Volume " + std::to_string(pct) + "%";
+    const int filled = volumeMuted_ ? 0 : std::clamp(pct * cols / 100, 0, cols);
+    std::string bar;
+    for (int i = 0; i < cols; ++i)
+      bar += i < filled ? '\x17'
+                        : '\x10'; // full block / thin line (custom characters)
+    return rowsFrame(center(title, cols), bar);
+  }
+
+  Frame spectrumFrame() {
+    const int cols = cfg_.cols;
+    if (spectrum_.status() == SpectrumTap::Status::NoTool)
+      return rowsFrame(center("Install parec", cols),
+                       center("(pipewire-pulse)", cols));
+    const std::vector<float> lv = spectrum_.levels();
+    std::string top, bottom;
+    for (int c = 0; c < cols; ++c) {
+      const float level = static_cast<std::size_t>(c) < lv.size()
+                              ? lv[static_cast<std::size_t>(c)]
+                              : 0.0F;
+      const int h = std::clamp(static_cast<int>(std::lround(level * 16.0F)), 0,
+                               16); // 2 rows x 8
+      const int lowRow = std::min(h, 8), highRow = std::max(0, h - 8);
+      bottom += lowRow > 0 ? static_cast<char>(0x10 + lowRow - 1) : ' ';
+      top += highRow > 0 ? static_cast<char>(0x10 + highRow - 1) : ' ';
+    }
+    return rowsFrame(top, bottom);
   }
 
   Frame statusFrame(Clock::time_point now) {
@@ -1840,16 +2468,28 @@ private:
   Clock::time_point start_ = Clock::now();
   std::string pushed_;
   std::shared_ptr<Lookup> lyrics_, captions_;
+  // popups
+  VolumeWatcher volume_;
+  NotificationWatcher notes_;
+  SpectrumTap spectrum_;
+  unsigned seenVolumeSerial_ = 0;
+  int volumePercent_ = 0;
+  bool volumeMuted_ = false;
+  std::map<std::string, double> playerVolume_;
+  std::string noteText_;
+  Clock::time_point noteUntil_{}, volumeUntil_{};
 };
 
 int main(int argc, char **argv) {
   if (argc >= 2 &&
       (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
-    std::puts("muzxlcd            start the LCD program (keep it running in "
-              "the background)\n"
-              "muzxlcd ctl mode next | prev | lyrics | captions | nowplaying | "
-              "clock | status\n"
-              "muzxlcd ctl modes | status | quit");
+    std::puts(
+        "muzxlcd            start the LCD program (keep it running in the "
+        "background)\n"
+        "muzxlcd ctl mode next | prev | lyrics | captions | nowplaying | "
+        "spectrum | clock | status\n"
+        "muzxlcd ctl modes | status | quit\n"
+        "muzxlcd ctl set modes lyrics,clock | set volume 0/1 | set notify 0/1");
     return 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "ctl") {
