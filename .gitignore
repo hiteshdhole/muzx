@@ -8,3 +8,8 @@ player
 
 # Build files
 build/
+music/
+*.mp3
+*.flac
+*.wav
+*.ogg
