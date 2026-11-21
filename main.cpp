@@ -62,7 +62,8 @@ int run() {
   if (app.fontSize > 0)
     applyFontSize(app.fontSize); // before the screen switches to raw mode
 
-  if (const char *mp = std::getenv("MUZX_MPRIS"); !(mp && std::string(mp) == "0"))
+  if (const char *mp = std::getenv("MUZX_MPRIS");
+      !(mp && std::string(mp) == "0"))
     app.mpris.start(); // media keys, playerctl, desktop media widget
 
   if (app.resumeMode != 0)
