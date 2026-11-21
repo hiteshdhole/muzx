@@ -31,10 +31,10 @@ struct Result {
 enum class State { Idle, Loading, Ready, NotFound };
 
 // ---- helpers (public so they can be tested) --------------------------------
-std::string sanitize(const std::string &text); // strips control codes
-Result parseLrc(const std::string &text);      // "[01:23.45]words"
-Result parsePlain(const std::string &text);    // lines without times
-std::string toLrc(const Result &result);       // inverse of parse*
+std::string sanitize(const std::string &text);        // strips control codes
+Result parseLrc(const std::string &text);             // "[01:23.45]words"
+Result parsePlain(const std::string &text);           // lines without times
+std::string toLrc(const Result &result);              // inverse of parse*
 std::string cleanTitleFromFilename(const std::string &path);
 std::string urlEncode(const std::string &text);
 // Picks the best lyrics out of an LRCLIB reply (one object or an array).

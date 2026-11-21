@@ -15,10 +15,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <functional>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -138,8 +138,7 @@ std::string hexHash(const std::string &text) { // FNV-1a, 64 bit
     h *= 1099511628211ULL;
   }
   char buf[17];
-  std::snprintf(buf, sizeof(buf), "%016llx",
-                static_cast<unsigned long long>(h));
+  std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
   return buf;
 }
 
@@ -191,9 +190,9 @@ static bool looksLikeDomain(const std::string &word) {
   const auto dot = w.rfind('.');
   if (dot == std::string::npos || dot == 0 || dot + 1 >= w.size())
     return false;
-  static const char *const kTlds[] = {
-      "com", "org", "net", "io", "in",  "co",   "app",  "me",
-      "fm",  "to",  "cc",  "tv", "xyz", "info", "site", "online"};
+  static const char *const kTlds[] = {"com", "org", "net", "io", "in", "co",
+                                      "app", "me",  "fm",  "to", "cc", "tv",
+                                      "xyz", "info", "site", "online"};
   const std::string tld = w.substr(dot + 1);
   bool known = false;
   for (const char *t : kTlds)
@@ -373,9 +372,8 @@ Result parseLrc(const std::string &input) {
       result.lines.push_back({std::max(0.0, t - offsetSeconds), lineText});
   }
 
-  std::stable_sort(
-      result.lines.begin(), result.lines.end(),
-      [](const Line &a, const Line &b) { return a.time < b.time; });
+  std::stable_sort(result.lines.begin(), result.lines.end(),
+                   [](const Line &a, const Line &b) { return a.time < b.time; });
   result.synced = !result.lines.empty();
   return result;
 }
@@ -490,30 +488,14 @@ bool parseJsonString(const char *&p, const char *e, std::string &out) {
       return false;
     const char esc = *p++;
     switch (esc) {
-    case '"':
-      out.push_back('"');
-      break;
-    case '\\':
-      out.push_back('\\');
-      break;
-    case '/':
-      out.push_back('/');
-      break;
-    case 'b':
-      out.push_back('\b');
-      break;
-    case 'f':
-      out.push_back('\f');
-      break;
-    case 'n':
-      out.push_back('\n');
-      break;
-    case 'r':
-      out.push_back('\r');
-      break;
-    case 't':
-      out.push_back('\t');
-      break;
+    case '"': out.push_back('"'); break;
+    case '\\': out.push_back('\\'); break;
+    case '/': out.push_back('/'); break;
+    case 'b': out.push_back('\b'); break;
+    case 'f': out.push_back('\f'); break;
+    case 'n': out.push_back('\n'); break;
+    case 'r': out.push_back('\r'); break;
+    case 't': out.push_back('\t'); break;
     case 'u': {
       std::uint32_t cp = 0;
       if (!parseHex4(p, e, cp))
@@ -695,9 +677,8 @@ void pickFromLrclib(const std::string &json, double duration, Result &synced,
         const std::string nameKey = matchKey(itName->second);
         bool related = false;
         for (const std::string &wanted : wantedKeys) {
-          if (nameKey.size() >= 3 &&
-              (nameKey.find(wanted) != std::string::npos ||
-               wanted.find(nameKey) != std::string::npos))
+          if (nameKey.size() >= 3 && (nameKey.find(wanted) != std::string::npos ||
+                                      wanted.find(nameKey) != std::string::npos))
             related = true;
         }
         if (!related)
@@ -711,9 +692,10 @@ void pickFromLrclib(const std::string &json, double duration, Result &synced,
     const double objDuration = itDur != obj.num.end() ? itDur->second : 0.0;
 
     if (itSynced != obj.str.end() && !trimCopy(itSynced->second).empty()) {
-      const double diff = (duration > 0.0 && objDuration > 0.0)
-                              ? std::fabs(objDuration - duration)
-                              : 0.0; // length unknown on either side: accept
+      const double diff =
+          (duration > 0.0 && objDuration > 0.0)
+              ? std::fabs(objDuration - duration)
+              : 0.0; // length unknown on either side: accept
       if (diff <= kSyncTolerance && diff < bestDiff) {
         Result r = parseLrc(itSynced->second);
         if (!r.lines.empty()) {
@@ -747,10 +729,10 @@ struct Tags {
 // can continue over following lines (multi-line lyrics).
 Tags readTags(const std::string &songPath) {
   Tags tags;
-  const CommandOutput out =
-      runCommand("ffprobe -v error -show_entries format_tags:stream_tags "
-                 "-of default=noprint_wrappers=1 " +
-                 shellQuote(songPath) + " 2>/dev/null");
+  const CommandOutput out = runCommand(
+      "ffprobe -v error -show_entries format_tags:stream_tags "
+      "-of default=noprint_wrappers=1 " +
+      shellQuote(songPath) + " 2>/dev/null");
   if (out.status != 0)
     return tags;
 
@@ -814,8 +796,9 @@ std::string fetchUrl(const std::string &url, bool &transient) {
     transient = true;
     return "";
   }
-  const CommandOutput out = runCommand("curl -s -f -m 6 -A 'muzx/1.0' -- " +
-                                       shellQuote(url) + " 2>/dev/null");
+  const CommandOutput out =
+      runCommand("curl -s -f -m 6 -A 'muzx/1.0' -- " + shellQuote(url) +
+                 " 2>/dev/null");
   if (out.status == 0)
     return out.text;
   if (out.status != 22) // 22 = the server answered with an HTTP error (404)
@@ -832,8 +815,9 @@ std::vector<std::string> splitDashes(const std::string &text) {
   std::size_t start = 0;
   for (;;) {
     const auto pos = text.find(" - ", start);
-    const std::string part = trimCopy(text.substr(
-        start, pos == std::string::npos ? std::string::npos : pos - start));
+    const std::string part = trimCopy(
+        text.substr(start, pos == std::string::npos ? std::string::npos
+                                                    : pos - start));
     if (!part.empty())
       parts.push_back(part);
     if (pos == std::string::npos)
@@ -849,8 +833,7 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
   const std::string title = tags.title.empty() ? fallbackTitle : tags.title;
 
   const std::vector<std::string> parts = splitDashes(title);
-  std::string
-      flat; // "Main Agar Saamne - Abhijeet" -> "Main Agar Saamne Abhijeet"
+  std::string flat; // "Main Agar Saamne - Abhijeet" -> "Main Agar Saamne Abhijeet"
   for (const std::string &p : parts)
     flat += (flat.empty() ? "" : " ") + p;
   if (flat.empty())
@@ -895,8 +878,7 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
     if (!tags.album.empty())
       url += "&album_name=" + urlEncode(tags.album);
     if (duration > 0.0)
-      url += "&duration=" +
-             std::to_string(static_cast<long>(std::lround(duration)));
+      url += "&duration=" + std::to_string(static_cast<long>(std::lround(duration)));
     if (consider(fetchUrl(url, transient), false))
       return true;
     if (transient)
@@ -916,8 +898,7 @@ bool lookupOnline(const Tags &tags, const std::string &fallbackTitle,
   std::vector<std::string> queries;
   auto addQuery = [&](const std::string &q) {
     const std::string t = trimCopy(q);
-    if (!t.empty() &&
-        std::find(queries.begin(), queries.end(), t) == queries.end())
+    if (!t.empty() && std::find(queries.begin(), queries.end(), t) == queries.end())
       queries.push_back(t);
   };
   addQuery(tags.artist + " " + flat);
@@ -1032,9 +1013,10 @@ bool lookupSyncedlyrics(const Tags &tags, const std::string &fallbackTitle,
   const fs::path outPath = workDir / "out.lrc";
 
   // `timeout` keeps a stuck provider from blocking the lookup thread.
-  const CommandOutput run = runCommand(
-      "timeout 20 " + shellQuote(bin) + " -o " + shellQuote(outPath.string()) +
-      " -- " + shellQuote(term) + " </dev/null 2>/dev/null");
+  const CommandOutput run =
+      runCommand("timeout 20 " + shellQuote(bin) + " -o " +
+                 shellQuote(outPath.string()) + " -- " + shellQuote(term) +
+                 " </dev/null 2>/dev/null");
   bool found = false;
   if (run.status != 0) {
     transient = true; // tool crashed, timed out or no network
@@ -1082,8 +1064,7 @@ std::optional<Result> findLyrics(const std::string &songPath, double duration,
     bool transient = false;
     const std::string cleaned = cleanTitleFromFilename(songPath);
     bool have = lookupOnline(tags, cleaned, duration, found, transient);
-    if ((!have || !found.synced) &&
-        !transient) { // nothing, or only untimed lyrics: try harder
+    if ((!have || !found.synced) && !transient) { // nothing, or only untimed lyrics: try harder
       Result better;
       if (lookupSyncedlyrics(tags, cleaned, duration, cacheDir, better,
                              transient)) {
@@ -1162,7 +1143,7 @@ struct Manager::Shared {
   bool pfStarted = false;
   std::vector<std::string> pfQueue;
   std::unordered_set<std::string> pfDone;
-  std::unordered_set<std::string> pfFound; // songs that have lyrics
+  std::unordered_set<std::string> pfFound;     // songs that have lyrics
   std::string pfCurrent;
 };
 
@@ -1323,8 +1304,7 @@ void Manager::setCacheDir(const fs::path &dir) {
     std::error_code entryEc;
     if (startsWith(it->path().filename().string(), "gen-") &&
         it->is_directory(entryEc) &&
-        fs::file_time_type::clock::now() -
-                fs::last_write_time(it->path(), entryEc) >
+        fs::file_time_type::clock::now() - fs::last_write_time(it->path(), entryEc) >
             std::chrono::hours(1))
       fs::remove_all(it->path(), entryEc);
   }

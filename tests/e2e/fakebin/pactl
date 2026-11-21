@@ -1,0 +1,13 @@
+#!/bin/bash
+# fake pactl: volume kept in $FAKE_AUDIO_DIR/vol (percent) and mute
+D=${FAKE_AUDIO_DIR:-/tmp}
+case "$1" in
+  get-sink-volume) echo "Volume: front-left: 30000 /  $(cat $D/vol 2>/dev/null || echo 50)% / -18.06 dB,   front-right: 30000 /  $(cat $D/vol 2>/dev/null || echo 50)% / -18.06 dB" ;;
+  get-sink-mute) echo "Mute: $(cat $D/mute 2>/dev/null || echo no)" ;;
+  subscribe)
+    echo "Event 'change' on server #1"
+    while true; do
+      if [ -f $D/fire ]; then rm -f $D/fire; echo "Event 'change' on sink #52"; fi
+      sleep 0.1
+    done ;;
+esac

@@ -8,6 +8,22 @@ Built with C++17 and SFML. Made for the [Kitty](https://sw.kovidgoyal.net/kitty/
 terminal (cover art uses Kitty's graphics protocol); everything else works in
 any modern terminal.
 
+## Screenshots
+
+![The player with the synced lyrics panel](docs/player.png)
+
+| | |
+|---|---|
+| ![Settings tab with the LCD HUB rows](docs/settings.png) | ![Folders tab](docs/folders.png) |
+
+The LCD hub on a 16x2 screen:
+
+![The LCD modes: lyrics, now playing, spectrum, clock, PC status, volume and notification popups](docs/lcd_modes.png)
+
+*The terminal pictures were made by running the program in a test setup (demo
+songs, no sound). The LCD pictures are drawn from the exact frames the hub
+sends to the Arduino; they are not photos of a real screen.*
+
 ## Features
 
 - Browse folders, queue songs, search by filename, shuffle and repeat
@@ -27,54 +43,61 @@ any modern terminal.
 
 ## Requirements
 
-| Needed for                                    | Package (Arch)                |
-| --------------------------------------------- | ----------------------------- |
-| everything                                    | `gcc`, `sfml`, `systemd-libs` |
-| cover art, font size                          | `kitty`                       |
-| Japanese kanji on the LCD (optional)          | `kakasi` (AUR)                |
-| notifications (optional)                      | `libnotify`                   |
-| media keys on i3 / Sway / Hyprland (optional) | `playerctl`                   |
+| Needed for | Package (Arch) |
+|---|---|
+| everything | `gcc`, `sfml`, `systemd-libs` |
+| cover art, font size | `kitty` |
+| Japanese kanji on the LCD (optional) | `kakasi` (AUR) |
+| notifications (optional) | `libnotify` |
+| media keys on i3 / Sway / Hyprland (optional) | `playerctl` |
 
 ## Build
 
 ```bash
-g++ -std=c++17 -O2 -pthread main.cpp lyrics.cpp audio_player.cpp cover.cpp \
-    queue.cpp selection.cpp config.cpp -o player \
-    -lsfml-audio -lsfml-system -lsystemd
-./player
+make            # builds ./player (only changed files are rebuilt)
+make run        # build and start
 ```
 
-Do not compile the test files (`*_test.cpp`, `keytest.cpp`): they have their
-own `main()`.
+Without `make`, compile every file of the player:
+
+```bash
+g++ -std=c++17 -O2 -pthread main.cpp terminal.cpp util.cpp state.cpp playback.cpp \
+    draw.cpp integration.cpp settings.cpp lyrics_panel.cpp screen.cpp input.cpp \
+    lyrics.cpp audio_player.cpp cover.cpp queue.cpp selection.cpp config.cpp \
+    -o player -lsfml-audio -lsfml-system -lsystemd
+```
+
+Do not compile the test files (`tests/*`, `lcdtest.cpp`, `keytest.cpp`): they
+have their own `main()`.
 
 On the first start MUZX asks for your music folder.
 
 ## Keys
 
-| Key                          | Action                                                         |
-| ---------------------------- | -------------------------------------------------------------- |
-| `Space`                      | Play / pause                                                   |
-| `←` `→` or `a` `d`           | Seek backward / forward                                        |
-| `n` / `b`                    | Next / previous song                                           |
-| `s`                          | Shuffle on / off                                               |
-| `R`                          | Repeat: off, all songs, one song                               |
-| `+` `-`                      | Volume                                                         |
-| `x`                          | Stop                                                           |
-| `i` / `v`                    | Album art / visualizer on or off                               |
-| `L`                          | Lyrics panel: right, below, off                                |
-| `[` `]`                      | Lyrics earlier / later by 0.5 s (saved for this song)          |
-| `\`                          | Reset the lyrics timing of this song                           |
-| `T`                          | Lyrics on the Arduino LCD, on or off                           |
-| `m` `M`                      | LCD hub: next / previous LCD mode (needs `muzxlcd`, see below) |
-| `Tab` `Shift+Tab` or `1`–`7` | Switch tabs                                                    |
-| `j` `k` or `↑` `↓`           | Move in lists                                                  |
-| `Enter` or `l`               | Open folder / play song                                        |
-| `Backspace` or `h`           | Parent folder                                                  |
-| `p` / `P`                    | Play this folder / play everything                             |
-| `e`                          | Add to queue                                                   |
-| `r` / `c`                    | Remove from queue / clear queue                                |
-| `/`                          | Search                                                         |
-| `q` or `Esc`                 | Quit                                                           |
+| Key | Action |
+|---|---|
+| `Space` | Play / pause |
+| `←` `→` or `a` `d` | Seek backward / forward |
+| `n` / `b` | Next / previous song |
+| `s` | Shuffle on / off |
+| `R` | Repeat: off, all songs, one song |
+| `+` `-` | Volume |
+| `x` | Stop |
+| `i` / `v` | Album art / visualizer on or off |
+| `L` | Lyrics panel: right, below, off |
+| `[` `]` | Lyrics earlier / later by 0.5 s (saved for this song) |
+| `\` | Reset the lyrics timing of this song |
+| `T` | Lyrics on the Arduino LCD, on or off |
+| `m` `M` | LCD hub: next / previous LCD mode (needs `muzxlcd`, see below) |
+| `Tab` `Shift+Tab` or `1`–`7` | Switch tabs |
+| `j` `k` or `↑` `↓` | Move in lists |
+| `Enter` or `l` | Open folder / play song |
+| `Backspace` or `h` | Parent folder |
+| `p` / `P` | Play this folder / play everything |
+| `e` | Add to queue |
+| `r` / `c` | Remove from queue / clear queue |
+| `/` | Search |
+| `q` or `Esc` | Quit |
 
 **Mouse:** click a tab, a button or a list row (click a selected row again to
 open or play it). Press on the progress bar and drag to seek; click the
@@ -119,8 +142,8 @@ It is remembered for that song in `~/.config/muzx/lyrics-offsets.txt`;
 can look up lyrics for the other songs in the background, the rest of the
 playlist first, then the whole music folder, one song at a time.
 
-- _Off_ (default): nothing happens in the background.
-- _On_: lyrics are looked up on the web, one song at a time. This is light.
+- *Off* (default): nothing happens in the background.
+- *On*: lyrics are looked up on the web, one song at a time. This is light.
   Songs that nobody has are remembered for 3 days and not asked again.
 
 Background lookups do not know the song length, so a version of the lyrics
@@ -152,10 +175,12 @@ Turn it off with `MUZX_MPRIS=0`.
 
 `muzxlcd` is a small background program that owns the Uno and switches it
 between modes: lyrics of anything playing, YouTube captions, now playing,
-clock and PC status. Switch with a button on the Uno (D2 to GND), with
+clock, PC status and live spectrum bars. It also pops up a volume bar and
+desktop notifications. Switch with a button on the Uno (D2 to GND), with
 `muzxlcd ctl mode next`, or with `m` / `M` in MUZX. While it runs, MUZX sends
 its lyrics to it instead of using the port itself (Settings shows
-"On (through the LCD hub)"). Setup, modes and settings are in `LCD_HUB.md`:
+"On (through the LCD hub)"). The modes and popups can be turned on and off in Settings > LCD HUB.
+Setup, modes and settings are in `LCD_HUB.md`:
 
 ```
 make muzxlcd
@@ -170,17 +195,47 @@ Stop it before uploading a new sketch: `systemctl --user stop muzxlcd`.
 
 ## Environment variables
 
-| Variable                                     | Meaning                     |
-| -------------------------------------------- | --------------------------- |
-| `MUZX_MOUSE=0`                               | turn the mouse off          |
-| `MUZX_MPRIS=0`                               | turn desktop media keys off |
-| `MUZX_LYRICS_ONLINE=0`                       | no online lyrics lookup     |
-| `MUZX_LCD`, `MUZX_LCD_PORT`, `MUZX_LCD_KANA` | LCD options (see above)     |
+| Variable | Meaning |
+|---|---|
+| `MUZX_MOUSE=0` | turn the mouse off |
+| `MUZX_MPRIS=0` | turn desktop media keys off |
+| `MUZX_LYRICS_ONLINE=0` | no online lyrics lookup |
+| `MUZX_LCD`, `MUZX_LCD_PORT`, `MUZX_LCD_KANA` | LCD options (see above) |
 
 ## Files
 
 `~/.config/muzx/` holds `queue.txt`, `stats.txt`, `settings.conf`,
 `lyrics-offsets.txt` and the `lyrics/` cache.
+
+## Project layout
+
+| File | Content |
+|---|---|
+| `main.cpp` | `run()` and `main()` |
+| `muzx.hpp` | the shared declarations (types, settings enum, function list) |
+| `terminal.cpp` | colours, keys, mouse, raw terminal, input reading |
+| `util.cpp` | strings, folders, song lists |
+| `state.cpp` | application state, statistics |
+| `playback.cpp` | play / next / previous, shuffle history, resume |
+| `draw.cpp` | the Folders, Queue, Search, Status and Keys tabs |
+| `settings.cpp` | the Settings tab, settings file, LCD HUB rows |
+| `lyrics_panel.cpp` | lyrics panel, text wrapping, LCD updates, prefetch queue |
+| `screen.cpp`, `input.cpp` | the whole screen; key and mouse handling |
+| `integration.cpp` | lyric timing offsets, MPRIS media keys, notifications |
+| `lyrics.cpp/.hpp`, `lcd_link.hpp` | lyrics finder; talking to the Arduino or the hub |
+| `muzxlcd.cpp`, `spectrum.hpp`, `muzx_lcd.ino` | LCD hub, spectrum analyser, Arduino sketch |
+| `tests/` | unit tests and the end-to-end test |
+
+## Tests
+
+```bash
+make test        # unit tests: parsers, text layout, shuffle, settings, spectrum
+make test-e2e    # the LCD hub with a fake LCD, fake players and fake sound
+```
+
+The unit tests need no sound card, screen or Arduino. The end-to-end test needs
+`python3` with `dbus-next` (`pip install dbus-next`) and `dbus-run-session`;
+without them it prints SKIP.
 
 ## Troubleshooting
 

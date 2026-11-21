@@ -15,18 +15,17 @@
 //   muzxlcd ctl <cmd>    talk to it  (mode, modes, status, quit)
 //
 // Settings (optional): ~/.config/muzx/lcd.conf, lines like  key=value
-//   modes=lyrics,captions,nowplaying,clock,status     which modes, in which
-//   order cols=16                                           20 for a 20x4
-//   screen port=/dev/ttyUSB0                                 (or env
-//   MUZX_LCD_PORT) captions_lang=en                                  caption
-//   language for yt-dlp page_seconds=3                                    how
-//   long each status page stays kana=0 1 = Japanese as katakana
+//   modes=lyrics,captions,nowplaying,clock,status     which modes, in which order
+//   cols=16                                           20 for a 20x4 screen
+//   port=/dev/ttyUSB0                                 (or env MUZX_LCD_PORT)
+//   captions_lang=en                                  caption language for yt-dlp
+//   page_seconds=3                                    how long each status page stays
+//   kana=0                                            1 = Japanese as katakana
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
+#include <array>
 #include <cmath>
-#include <complex>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +56,7 @@
 #include <systemd/sd-bus.h>
 
 #include "lcd_link.hpp" // text conversion for the LCD (Japanese, Hindi ... -> letters)
+#include "spectrum.hpp"   // sound -> bar heights for the spectrum mode
 
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
@@ -197,21 +197,19 @@ static std::string runProgram(const std::vector<std::string> &args, bool &ok,
 // ===========================================================================
 struct Config {
   int cols = 16;
-  std::vector<std::string> modes{"lyrics",   "captions", "nowplaying",
-                                 "spectrum", "clock",    "status"};
+  std::vector<std::string> modes{"lyrics", "captions", "nowplaying", "spectrum", "clock", "status"};
   std::string port;
   std::string captionsLang = "en";
   double pageSeconds = 3.0;
   bool kana = false;
-  bool volumePopup = true;   // a volume bar appears when the volume changes
-  bool notifications = true; // desktop notifications appear for a few seconds
+  bool volumePopup = true;          // a volume bar appears when the volume changes
+  bool notifications = true;        // desktop notifications appear for a few seconds
   double notifySeconds = 6.0;
-  std::string spectrumSource =
-      "@DEFAULT_MONITOR@"; // what parec records for the spectrum
+  std::string spectrumSource = "@DEFAULT_MONITOR@"; // what parec records for the spectrum
 };
 
-static const std::vector<std::string> kAllModes{
-    "lyrics", "captions", "nowplaying", "spectrum", "clock", "status"};
+static const std::vector<std::string> kAllModes{"lyrics", "captions", "nowplaying",
+                                                "spectrum", "clock",  "status"};
 
 static std::string modeTitle(const std::string &m) {
   if (m == "lyrics")
@@ -240,16 +238,14 @@ static Config loadConfig() {
     const std::size_t eq = line.find('=');
     if (eq == std::string::npos)
       continue;
-    const std::string k = trim(line.substr(0, eq)),
-                      v = trim(line.substr(eq + 1));
+    const std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
     if (k == "cols") {
       c.cols = std::clamp(std::atoi(v.c_str()), 8, 40);
     } else if (k == "modes") {
       std::vector<std::string> modes;
       for (const std::string &m : split(v, ',')) {
         const std::string name = lower(trim(m));
-        if (std::find(kAllModes.begin(), kAllModes.end(), name) !=
-                kAllModes.end() &&
+        if (std::find(kAllModes.begin(), kAllModes.end(), name) != kAllModes.end() &&
             std::find(modes.begin(), modes.end(), name) == modes.end())
           modes.push_back(name);
       }
@@ -408,21 +404,11 @@ struct JsonParser {
         break;
       c = s[i++];
       switch (c) {
-      case 'n':
-        out += '\n';
-        break;
-      case 't':
-        out += '\t';
-        break;
-      case 'r':
-        out += '\r';
-        break;
-      case 'b':
-        out += '\b';
-        break;
-      case 'f':
-        out += '\f';
-        break;
+      case 'n': out += '\n'; break;
+      case 't': out += '\t'; break;
+      case 'r': out += '\r'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
       case 'u': {
         unsigned cp = hex4();
         if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < s.size() && s[i] == '\\' &&
@@ -434,9 +420,7 @@ struct JsonParser {
         appendUtf8(out, cp);
         break;
       }
-      default:
-        out += c;
-        break;
+      default: out += c; break;
       }
     }
     if (i < s.size())
@@ -582,9 +566,8 @@ static std::vector<TimedLine> parseLrc(const std::string &lrc) {
     for (double t : times)
       out.push_back({t, 1e9, text});
   }
-  std::stable_sort(
-      out.begin(), out.end(),
-      [](const TimedLine &a, const TimedLine &b) { return a.start < b.start; });
+  std::stable_sort(out.begin(), out.end(),
+                   [](const TimedLine &a, const TimedLine &b) { return a.start < b.start; });
   return out;
 }
 
@@ -611,8 +594,8 @@ static std::string stripVttTags(const std::string &in) {
   }
   // a few common entities
   const std::pair<const char *, const char *> ents[] = {
-      {"&amp;", "&"},   {"&lt;", "<"},  {"&gt;", ">"},
-      {"&quot;", "\""}, {"&#39;", "'"}, {"&nbsp;", " "}};
+      {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&#39;", "'"},
+      {"&nbsp;", " "}};
   for (const auto &e : ents) {
     std::size_t p = 0;
     while ((p = out.find(e.first, p)) != std::string::npos) {
@@ -653,9 +636,8 @@ static std::vector<TimedLine> parseVtt(const std::string &vtt) {
     }
     out.push_back({start, end, last});
   }
-  std::stable_sort(
-      out.begin(), out.end(),
-      [](const TimedLine &a, const TimedLine &b) { return a.start < b.start; });
+  std::stable_sort(out.begin(), out.end(),
+                   [](const TimedLine &a, const TimedLine &b) { return a.start < b.start; });
   // a line should vanish when the next one starts
   for (std::size_t k = 0; k + 1 < out.size(); ++k)
     out[k].end = std::min(out[k].end, out[k + 1].start);
@@ -664,9 +646,8 @@ static std::vector<TimedLine> parseVtt(const std::string &vtt) {
 
 // index of the last line with start <= pos, or -1
 static int lineAt(const std::vector<TimedLine> &lines, double pos) {
-  const auto it = std::upper_bound(
-      lines.begin(), lines.end(), pos,
-      [](double p, const TimedLine &l) { return p < l.start; });
+  const auto it = std::upper_bound(lines.begin(), lines.end(), pos,
+                                   [](double p, const TimedLine &l) { return p < l.start; });
   return static_cast<int>(it - lines.begin()) - 1;
 }
 
@@ -674,8 +655,8 @@ static int lineAt(const std::vector<TimedLine> &lines, double pos) {
 // MPRIS: what is playing right now (Spotify, browsers, MUZX ...)
 // ===========================================================================
 struct PlayerInfo {
-  std::string bus;    // org.mpris.MediaPlayer2.spotify
-  std::string status; // Playing / Paused / Stopped
+  std::string bus;     // org.mpris.MediaPlayer2.spotify
+  std::string status;  // Playing / Paused / Stopped
   std::string title, artist, url;
   double lengthSec = 0;
   double posSec = 0;
@@ -696,16 +677,13 @@ struct PlayerInfo {
     return p;
   }
   std::string key() const {
-    return bus + "|" + title + "|" + artist + "|" +
-           std::to_string(static_cast<long>(lengthSec));
+    return bus + "|" + title + "|" + artist + "|" + std::to_string(static_cast<long>(lengthSec));
   }
 };
 
 class MprisWatcher {
 public:
-  MprisWatcher() {
-    worker_ = std::thread([this] { loop(); });
-  }
+  MprisWatcher() { worker_ = std::thread([this] { loop(); }); }
   ~MprisWatcher() {
     stop_ = true;
     if (worker_.joinable())
@@ -767,8 +745,7 @@ private:
     p.sampled = Clock::now();
     sd_bus_error err = SD_BUS_ERROR_NULL;
     char *status = nullptr;
-    if (sd_bus_get_property_string(bus, name, kPath, kIface, "PlaybackStatus",
-                                   &err, &status) >= 0 &&
+    if (sd_bus_get_property_string(bus, name, kPath, kIface, "PlaybackStatus", &err, &status) >= 0 &&
         status)
       p.status = status;
     free(status);
@@ -776,16 +753,14 @@ private:
     err = SD_BUS_ERROR_NULL;
 
     double vol = 0;
-    if (sd_bus_get_property_trivial(bus, name, kPath, kIface, "Volume", &err,
-                                    'd', &vol) >= 0 &&
+    if (sd_bus_get_property_trivial(bus, name, kPath, kIface, "Volume", &err, 'd', &vol) >= 0 &&
         std::isfinite(vol))
       p.volume = vol;
     sd_bus_error_free(&err);
     err = SD_BUS_ERROR_NULL;
 
     std::int64_t pos = 0;
-    if (sd_bus_get_property_trivial(bus, name, kPath, kIface, "Position", &err,
-                                    'x', &pos) >= 0) {
+    if (sd_bus_get_property_trivial(bus, name, kPath, kIface, "Position", &err, 'x', &pos) >= 0) {
       p.posSec = static_cast<double>(pos) / 1e6;
       p.sampled = Clock::now();
     }
@@ -793,9 +768,7 @@ private:
     err = SD_BUS_ERROR_NULL;
 
     sd_bus_message *m = nullptr;
-    if (sd_bus_get_property(bus, name, kPath, kIface, "Metadata", &err, &m,
-                            "a{sv}") >= 0 &&
-        m)
+    if (sd_bus_get_property(bus, name, kPath, kIface, "Metadata", &err, &m, "a{sv}") >= 0 && m)
       readMetadata(m, p);
     if (m)
       sd_bus_message_unref(m);
@@ -811,8 +784,7 @@ private:
       sd_bus_message_read_basic(m, 's', &key);
       char type = 0;
       const char *contents = nullptr;
-      if (sd_bus_message_peek_type(m, &type, &contents) < 0 || type != 'v' ||
-          !contents) {
+      if (sd_bus_message_peek_type(m, &type, &contents) < 0 || type != 'v' || !contents) {
         break;
       }
       const std::string k = key ? key : "";
@@ -860,7 +832,7 @@ private:
       sd_bus_message_exit_container(m); // v
       sd_bus_message_exit_container(m); // e
     }
-    sd_bus_message_exit_container(m); // a (may fail if we broke out: harmless)
+    sd_bus_message_exit_container(m);   // a (may fail if we broke out: harmless)
   }
 
   mutable std::mutex mu_;
@@ -906,8 +878,7 @@ static std::string cleanTitle(std::string t) {
 
 static std::string cleanArtist(std::string a) {
   const std::string suffix = " - Topic";
-  if (a.size() > suffix.size() &&
-      a.compare(a.size() - suffix.size(), suffix.size(), suffix) == 0)
+  if (a.size() > suffix.size() && a.compare(a.size() - suffix.size(), suffix.size(), suffix) == 0)
     a.erase(a.size() - suffix.size());
   return trim(a);
 }
@@ -924,8 +895,7 @@ static std::vector<LrcQuery> lrcCandidates(const PlayerInfo &p) {
     return out;
   const std::size_t dash = title.find(" - ");
   if (dash != std::string::npos) {
-    const std::string a = trim(title.substr(0, dash)),
-                      b = trim(title.substr(dash + 3));
+    const std::string a = trim(title.substr(0, dash)), b = trim(title.substr(dash + 3));
     out.push_back({a, b}); // "Artist - Song" is the usual order on YouTube
     if (!artist.empty())
       out.push_back({artist, b});
@@ -936,12 +906,10 @@ static std::vector<LrcQuery> lrcCandidates(const PlayerInfo &p) {
   return out;
 }
 
-static std::string
-lrclibGet(const std::vector<std::string> &args, const std::string &path,
-          const std::vector<std::pair<std::string, std::string>> &query) {
-  std::vector<std::string> cmd{
-      "curl", "-sS", "-f",          "--max-time",       "8",
-      "-G",   "-A",  "muzxlcd/1.0", lrclibBase() + path};
+static std::string lrclibGet(const std::vector<std::string> &args, const std::string &path,
+                             const std::vector<std::pair<std::string, std::string>> &query) {
+  std::vector<std::string> cmd{"curl", "-sS",           "-f",         "--max-time", "8",
+                               "-G",   "-A",            "muzxlcd/1.0", lrclibBase() + path};
   for (const auto &kv : query) {
     cmd.push_back("--data-urlencode");
     cmd.push_back(kv.first + "=" + kv.second);
@@ -962,8 +930,7 @@ static std::string findSyncedLyrics(const PlayerInfo &p, bool &transient) {
       std::vector<std::pair<std::string, std::string>> params{
           {"artist_name", q.artist}, {"track_name", q.track}};
       if (p.lengthSec > 1)
-        params.push_back({"duration", std::to_string(static_cast<int>(
-                                          std::lround(p.lengthSec)))});
+        params.push_back({"duration", std::to_string(static_cast<int>(std::lround(p.lengthSec)))});
       const std::string body = lrclibGet({}, "/api/get", params);
       if (!body.empty()) {
         anyReply = true;
@@ -974,9 +941,8 @@ static std::string findSyncedLyrics(const PlayerInfo &p, bool &transient) {
         }
       }
     }
-    const std::string body = lrclibGet(
-        {}, "/api/search",
-        {{"q", q.artist.empty() ? q.track : q.artist + " " + q.track}});
+    const std::string body =
+        lrclibGet({}, "/api/search", {{"q", q.artist.empty() ? q.track : q.artist + " " + q.track}});
     if (body.empty())
       continue;
     anyReply = true;
@@ -994,8 +960,8 @@ static std::string findSyncedLyrics(const PlayerInfo &p, bool &transient) {
       double score = 0;
       const std::string name = lower(item.getStr("trackName"));
       const std::string art = lower(item.getStr("artistName"));
-      if (!wantTrack.empty() && (name.find(wantTrack) != std::string::npos ||
-                                 wantTrack.find(name) != std::string::npos))
+      if (!wantTrack.empty() &&
+          (name.find(wantTrack) != std::string::npos || wantTrack.find(name) != std::string::npos))
         score += 10;
       if (!wantArtist.empty() && art.find(wantArtist) != std::string::npos)
         score += 5;
@@ -1035,9 +1001,7 @@ struct Lookup {
     doneMs = nowMs();
     state = s;
   }
-  double ageSeconds() const {
-    return static_cast<double>(nowMs() - doneMs) / 1000.0;
-  }
+  double ageSeconds() const { return static_cast<double>(nowMs() - doneMs) / 1000.0; }
 };
 
 static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
@@ -1047,17 +1011,14 @@ static std::shared_ptr<Lookup> startLyricsLookup(const PlayerInfo &p) {
     const fs::path dir = cacheDir() / "lyrics";
     std::error_code ec;
     fs::create_directories(dir, ec);
-    const std::string id =
-        hex(fnv(cleanArtist(p.artist) + "|" + cleanTitle(p.title) + "|" +
-                std::to_string(static_cast<int>(p.lengthSec))));
-    const fs::path lrcFile = dir / (id + ".lrc"),
-                   noneFile = dir / (id + ".none");
+    const std::string id = hex(fnv(cleanArtist(p.artist) + "|" + cleanTitle(p.title) + "|" +
+                                   std::to_string(static_cast<int>(p.lengthSec))));
+    const fs::path lrcFile = dir / (id + ".lrc"), noneFile = dir / (id + ".none");
     std::string lrc;
     if (fs::exists(lrcFile, ec)) {
       lrc = readFile(lrcFile);
     } else if (fs::exists(noneFile, ec) &&
-               fs::file_time_type::clock::now() -
-                       fs::last_write_time(noneFile, ec) <
+               fs::file_time_type::clock::now() - fs::last_write_time(noneFile, ec) <
                    std::chrono::hours(24)) {
       lookup->finish(Lookup::None);
       return;
@@ -1109,8 +1070,7 @@ static std::string youtubeId(const std::string &url) {
   return id;
 }
 
-static std::shared_ptr<Lookup> startCaptionLookup(const PlayerInfo &p,
-                                                  const std::string &lang) {
+static std::shared_ptr<Lookup> startCaptionLookup(const PlayerInfo &p, const std::string &lang) {
   auto lookup = std::make_shared<Lookup>();
   lookup->key = youtubeId(p.url) + "|" + lang;
   const std::string id = youtubeId(p.url);
@@ -1135,10 +1095,9 @@ static std::shared_ptr<Lookup> startCaptionLookup(const PlayerInfo &p,
     if (vtt.empty()) {
       bool ok = false;
       int code = 0;
-      runProgram({"timeout", "90", "yt-dlp", "--skip-download", "--no-warnings",
-                  "--no-playlist", "--write-subs", "--write-auto-subs",
-                  "--sub-langs", lang + ".*," + lang, "--sub-format", "vtt",
-                  "-o", (dir / "%(id)s.%(ext)s").string(),
+      runProgram({"timeout", "90", "yt-dlp", "--skip-download", "--no-warnings", "--no-playlist",
+                  "--write-subs", "--write-auto-subs", "--sub-langs", lang + ".*," + lang,
+                  "--sub-format", "vtt", "-o", (dir / "%(id)s.%(ext)s").string(),
                   "https://www.youtube.com/watch?v=" + id},
                  ok, &code);
       if (code == 127) {
@@ -1190,7 +1149,7 @@ public:
         total += x;
       if (prevTotal_ > 0 && total > prevTotal_)
         cpu_ = 100.0 * (1.0 - static_cast<double>(idle - prevIdle_) /
-                                  static_cast<double>(total - prevTotal_));
+                                   static_cast<double>(total - prevTotal_));
       prevIdle_ = idle;
       prevTotal_ = total;
     }
@@ -1207,8 +1166,7 @@ public:
           avail = val;
       }
       if (total > 0)
-        ram_ = 100.0 * static_cast<double>(total - avail) /
-               static_cast<double>(total);
+        ram_ = 100.0 * static_cast<double>(total - avail) / static_cast<double>(total);
     }
     { // temperature: hottest sensor
       double best = -1;
@@ -1217,9 +1175,8 @@ public:
         for (const auto &e : fs::directory_iterator(root, ec)) {
           for (const auto &f : fs::directory_iterator(e.path(), ec)) {
             const std::string n = f.path().filename().string();
-            const bool isTemp =
-                (n == "temp") || (n.rfind("temp", 0) == 0 &&
-                                  n.find("_input") != std::string::npos);
+            const bool isTemp = (n == "temp") || (n.rfind("temp", 0) == 0 &&
+                                                   n.find("_input") != std::string::npos);
             if (!isTemp)
               continue;
             std::ifstream in(f.path());
@@ -1267,8 +1224,7 @@ public:
     { // battery
       battery_ = -1;
       std::error_code ec;
-      for (const auto &e :
-           fs::directory_iterator("/sys/class/power_supply", ec)) {
+      for (const auto &e : fs::directory_iterator("/sys/class/power_supply", ec)) {
         if (e.path().filename().string().rfind("BAT", 0) != 0)
           continue;
         std::ifstream cap(e.path() / "capacity"), st(e.path() / "status");
@@ -1292,8 +1248,7 @@ public:
 private:
   Clock::time_point last_{};
   unsigned long long prevIdle_ = 0, prevTotal_ = 0, prevRx_ = 0, prevTx_ = 0;
-  double cpu_ = 0, ram_ = 0, temp_ = -1, load_ = 0, uptime_ = 0, down_ = 0,
-         up_ = 0;
+  double cpu_ = 0, ram_ = 0, temp_ = -1, load_ = 0, uptime_ = 0, down_ = 0, up_ = 0;
   int battery_ = -1;
   std::string batteryState_;
 };
@@ -1390,9 +1345,7 @@ public:
     unsigned serial = 0; // goes up with every change
   };
 
-  VolumeWatcher() {
-    worker_ = std::thread([this] { loop(); });
-  }
+  VolumeWatcher() { worker_ = std::thread([this] { loop(); }); }
   ~VolumeWatcher() {
     stop_ = true;
     if (worker_.joinable())
@@ -1440,16 +1393,13 @@ private:
       const bool missing = child.exitCode() == 127;
       child.stop();
       if (!stop_)
-        sleepUnless(stop_,
-                    missing ? 60000
-                            : 5000); // pactl not installed: do not keep trying
+        sleepUnless(stop_, missing ? 60000 : 5000); // pactl not installed: do not keep trying
     }
   }
 
   void readVolume(bool baseline) {
     bool ok = false;
-    const std::string vol =
-        runProgram({"pactl", "get-sink-volume", "@DEFAULT_SINK@"}, ok);
+    const std::string vol = runProgram({"pactl", "get-sink-volume", "@DEFAULT_SINK@"}, ok);
     if (!ok)
       return;
     int percent = -1;
@@ -1462,8 +1412,7 @@ private:
         percent = std::atoi(vol.substr(b, pct - b).c_str());
     }
     bool mok = false;
-    const std::string mute =
-        runProgram({"pactl", "get-sink-mute", "@DEFAULT_SINK@"}, mok);
+    const std::string mute = runProgram({"pactl", "get-sink-mute", "@DEFAULT_SINK@"}, mok);
     const bool muted = mok && mute.find("yes") != std::string::npos;
     if (percent < 0)
       return;
@@ -1492,9 +1441,7 @@ struct Notification {
 
 class NotificationWatcher {
 public:
-  NotificationWatcher() {
-    worker_ = std::thread([this] { loop(); });
-  }
+  NotificationWatcher() { worker_ = std::thread([this] { loop(); }); }
   ~NotificationWatcher() {
     stop_ = true;
     if (worker_.joinable())
@@ -1574,38 +1521,13 @@ private:
 // PulseAudio) and turns it into one bar per LCD column. It only records while
 // the spectrum mode is on screen.
 // ---------------------------------------------------------------------------
-static void fftInPlace(std::vector<std::complex<float>> &a) {
-  const std::size_t n = a.size();
-  for (std::size_t i = 1, j = 0; i < n; ++i) { // bit reversal
-    std::size_t bit = n >> 1;
-    for (; j & bit; bit >>= 1)
-      j ^= bit;
-    j ^= bit;
-    if (i < j)
-      std::swap(a[i], a[j]);
-  }
-  for (std::size_t len = 2; len <= n; len <<= 1) {
-    const float ang = -2.0F * 3.14159265358979F / static_cast<float>(len);
-    const std::complex<float> wlen(std::cos(ang), std::sin(ang));
-    for (std::size_t i = 0; i < n; i += len) {
-      std::complex<float> w(1.0F, 0.0F);
-      for (std::size_t k = 0; k < len / 2; ++k) {
-        const std::complex<float> u = a[i + k], v = a[i + k + len / 2] * w;
-        a[i + k] = u + v;
-        a[i + k + len / 2] = u - v;
-        w *= wlen;
-      }
-    }
-  }
-}
-
 class SpectrumTap {
 public:
   enum class Status { Idle, Running, NoTool };
 
   SpectrumTap(std::string source, int bands)
-      : source_(std::move(source)), bands_(std::max(4, bands)),
-        levels_(static_cast<std::size_t>(std::max(4, bands)), 0.0F) {
+      : source_(std::move(source)), analyzer_(bands),
+        levels_(static_cast<std::size_t>(analyzer_.bands()), 0.0F) {
     worker_ = std::thread([this] { loop(); });
   }
   ~SpectrumTap() {
@@ -1621,28 +1543,25 @@ public:
   }
 
 private:
-  static constexpr int kRate = 16000;
-  static constexpr std::size_t kWindow = 512;
-
   void loop() {
     while (!stop_) {
       if (!wanted_) {
         status_ = Status::Idle;
-        setLevels(std::vector<float>(static_cast<std::size_t>(bands_), 0.0F));
+        analyzer_.reset();
+        publish();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         continue;
       }
       ChildProcess child;
       if (!child.start({"parec", "-d", source_, "--format=s16le",
-                        "--rate=" + std::to_string(kRate), "--channels=1",
+                        "--rate=" + std::to_string(spectrum::Analyzer::kRate), "--channels=1",
                         "--latency-msec=30"})) {
         sleepUnless(stop_, 3000);
         continue;
       }
       status_ = Status::Running;
-      std::vector<std::int16_t> samples;
       std::string pending;
-      std::size_t sinceLast = 0;
+      std::vector<std::int16_t> chunk;
       while (!stop_ && wanted_) {
         pollfd pfd{child.fd, POLLIN, 0};
         if (::poll(&pfd, 1, 200) <= 0)
@@ -1653,20 +1572,12 @@ private:
           break;
         pending.append(tmp, static_cast<std::size_t>(n));
         const std::size_t whole = pending.size() / 2;
-        for (std::size_t i = 0; i < whole; ++i) {
-          std::int16_t v;
-          std::memcpy(&v, pending.data() + i * 2, 2);
-          samples.push_back(v);
-        }
+        chunk.resize(whole);
+        if (whole > 0)
+          std::memcpy(chunk.data(), pending.data(), whole * 2);
         pending.erase(0, whole * 2);
-        sinceLast += whole;
-        if (samples.size() > kWindow * 4)
-          samples.erase(samples.begin(),
-                        samples.end() - static_cast<std::ptrdiff_t>(kWindow));
-        if (samples.size() >= kWindow && sinceLast >= 256) {
-          sinceLast = 0;
-          analyse(samples);
-        }
+        if (analyzer_.push(chunk.data(), whole))
+          publish();
       }
       const int code = child.exitCode();
       child.stop();
@@ -1679,54 +1590,13 @@ private:
     }
   }
 
-  void analyse(const std::vector<std::int16_t> &samples) {
-    std::vector<std::complex<float>> buf(kWindow);
-    const std::size_t off = samples.size() - kWindow;
-    for (std::size_t i = 0; i < kWindow; ++i) {
-      const float hann =
-          0.5F - 0.5F * std::cos(2.0F * 3.14159265F * static_cast<float>(i) /
-                                 static_cast<float>(kWindow - 1));
-      buf[i] = std::complex<float>(static_cast<float>(samples[off + i]) * hann,
-                                   0.0F);
-    }
-    fftInPlace(buf);
-    const float binHz = static_cast<float>(kRate) / static_cast<float>(kWindow);
-    const float fullScaleDb =
-        20.0F * std::log10(32768.0F * static_cast<float>(kWindow) / 4.0F);
-    std::vector<float> now(static_cast<std::size_t>(bands_), 0.0F);
-    const float lowHz = 60.0F, highHz = 7500.0F;
-    for (int b = 0; b < bands_; ++b) {
-      const float f0 =
-          lowHz * std::pow(highHz / lowHz,
-                           static_cast<float>(b) / static_cast<float>(bands_));
-      const float f1 =
-          lowHz * std::pow(highHz / lowHz, static_cast<float>(b + 1) /
-                                               static_cast<float>(bands_));
-      std::size_t i0 = static_cast<std::size_t>(std::lround(f0 / binHz));
-      std::size_t i1 = static_cast<std::size_t>(std::lround(f1 / binHz));
-      i0 = std::clamp<std::size_t>(i0, 1, kWindow / 2 - 1);
-      i1 = std::clamp<std::size_t>(std::max(i1, i0 + 1), 2, kWindow / 2);
-      float mag = 0.0F;
-      for (std::size_t i = i0; i < i1; ++i)
-        mag = std::max(mag, std::abs(buf[i]));
-      const float db = 20.0F * std::log10(mag + 1e-6F) - fullScaleDb;
-      const float tilt = 8.0F * static_cast<float>(b) /
-                         static_cast<float>(bands_); // highs are quieter
-      now[static_cast<std::size_t>(b)] =
-          std::clamp((db + tilt + 70.0F) / 55.0F, 0.0F, 1.0F);
-    }
+  void publish() {
     std::lock_guard<std::mutex> lock(mu_);
-    for (std::size_t b = 0; b < levels_.size(); ++b) // quick up, slow down
-      levels_[b] = std::max(now[b], levels_[b] - 0.05F);
-  }
-
-  void setLevels(const std::vector<float> &v) {
-    std::lock_guard<std::mutex> lock(mu_);
-    levels_ = v;
+    levels_ = analyzer_.levels();
   }
 
   std::string source_;
-  int bands_;
+  spectrum::Analyzer analyzer_; // only used by the worker thread
   mutable std::mutex mu_;
   std::vector<float> levels_;
   std::atomic<bool> wanted_{false};
@@ -1739,7 +1609,7 @@ private:
 // the LCD: serial port + frames
 // ===========================================================================
 struct Frame {
-  bool rows = false; // two fixed rows (a, b) instead of free text
+  bool rows = false;       // two fixed rows (a, b) instead of free text
   std::string a, b, text;
   bool operator==(const Frame &o) const {
     return rows == o.rows && a == o.a && b == o.b && text == o.text;
@@ -1747,9 +1617,7 @@ struct Frame {
 };
 
 static std::string fit(const std::string &s, int cols) {
-  return s.size() > static_cast<std::size_t>(cols)
-             ? s.substr(0, static_cast<std::size_t>(cols))
-             : s;
+  return s.size() > static_cast<std::size_t>(cols) ? s.substr(0, static_cast<std::size_t>(cols)) : s;
 }
 
 static std::string center(const std::string &s, int cols) {
@@ -1840,8 +1708,7 @@ public:
       return; // the Uno restarts when the port opens
     std::string msg;
     if (f.rows)
-      msg = fit(convert(f.a), cfg_.cols) + '\x01' +
-            fit(convert(f.b), cfg_.cols) + '\n';
+      msg = fit(convert(f.a), cfg_.cols) + '\x01' + fit(convert(f.b), cfg_.cols) + '\n';
     else
       msg = convert(f.text) + '\n';
     if (msg == last_ && now - lastWrite_ < std::chrono::milliseconds(2500))
@@ -1863,8 +1730,7 @@ private:
       return convOut_;
     convIn_ = s;
     convOut_ = lcdtext::toLcd(s, cfg_.kana);
-    while (!convOut_.empty() &&
-           (convOut_.back() == '\n' || convOut_.back() == '\r'))
+    while (!convOut_.empty() && (convOut_.back() == '\n' || convOut_.back() == '\r'))
       convOut_.pop_back();
     return convOut_;
   }
@@ -1873,8 +1739,8 @@ private:
     std::vector<std::string> candidates;
     if (!cfg_.port.empty())
       candidates.push_back(cfg_.port);
-    for (const char *p : {"/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2",
-                          "/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2"})
+    for (const char *p : {"/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyACM0",
+                          "/dev/ttyACM1", "/dev/ttyACM2"})
       candidates.push_back(p);
     for (const std::string &p : candidates) {
       const int fd = ::open(p.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -1927,8 +1793,7 @@ static void onSignal(int) { g_quit = true; }
 
 class Hub {
 public:
-  Hub(const Config &cfg)
-      : cfg_(cfg), lcd_(cfg), spectrum_(cfg.spectrumSource, cfg.cols) {
+  Hub(const Config &cfg) : cfg_(cfg), lcd_(cfg), spectrum_(cfg.spectrumSource, cfg.cols) {
     const std::string saved = trim(readFile(configDir() / "lcd.state"));
     for (std::size_t i = 0; i < cfg_.modes.size(); ++i)
       if (cfg_.modes[i] == saved)
@@ -1982,12 +1847,9 @@ private:
     }
     std::strcpy(addr.sun_path, path.c_str());
     ::unlink(path.c_str());
-    const int fd =
-        ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0 ||
-        ::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      std::fprintf(stderr, "muzxlcd: cannot create %s: %s\n", path.c_str(),
-                   std::strerror(errno));
+    const int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || ::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      std::fprintf(stderr, "muzxlcd: cannot create %s: %s\n", path.c_str(), std::strerror(errno));
       if (fd >= 0)
         ::close(fd);
       return -1;
@@ -2001,9 +1863,8 @@ private:
       char buf[2048];
       sockaddr_un from{};
       socklen_t fromLen = sizeof(from);
-      const ssize_t n =
-          ::recvfrom(sock, buf, sizeof(buf) - 1, MSG_DONTWAIT,
-                     reinterpret_cast<sockaddr *>(&from), &fromLen);
+      const ssize_t n = ::recvfrom(sock, buf, sizeof(buf) - 1, MSG_DONTWAIT,
+                                   reinterpret_cast<sockaddr *>(&from), &fromLen);
       if (n <= 0)
         return;
       std::string msg(buf, static_cast<std::size_t>(n));
@@ -2019,8 +1880,7 @@ private:
   std::string command(const std::string &msg) {
     const std::size_t sp = msg.find(' ');
     const std::string cmd = lower(msg.substr(0, sp));
-    const std::string arg =
-        sp == std::string::npos ? "" : trim(msg.substr(sp + 1));
+    const std::string arg = sp == std::string::npos ? "" : trim(msg.substr(sp + 1));
     if (cmd == "ping")
       return "pong";
     if (cmd == "lyric") { // pushed by MUZX
@@ -2042,8 +1902,7 @@ private:
         bool found = false;
         for (std::size_t i = 0; i < cfg_.modes.size(); ++i) {
           const std::string &m = cfg_.modes[i];
-          if (m == want || lower(modeTitle(m)) == want ||
-              (want == "time" && m == "clock") ||
+          if (m == want || lower(modeTitle(m)) == want || (want == "time" && m == "clock") ||
               (want == "pc" && m == "status")) {
             setMode(i);
             found = true;
@@ -2060,30 +1919,25 @@ private:
     if (cmd == "status") {
       // key=value pairs; "lcd=" is last because its value can contain spaces
       return "mode=" + cfg_.modes[mode_] + " modes=" + join(cfg_.modes) +
-             " all=" + join(kAllModes) +
-             " volume=" + (cfg_.volumePopup ? "1" : "0") +
-             " notify=" + (cfg_.notifications ? "1" : "0") + " lcd=" +
-             (lcd_.connected() ? lcd_.port() : std::string("not connected"));
+             " all=" + join(kAllModes) + " volume=" + (cfg_.volumePopup ? "1" : "0") +
+             " notify=" + (cfg_.notifications ? "1" : "0") +
+             " lcd=" + (lcd_.connected() ? lcd_.port() : std::string("not connected"));
     }
-    if (cmd == "set") { // set modes a,b,c | set volume 0/1 | set notify 0/1
-                        // (saved in lcd.conf)
+    if (cmd == "set") { // set modes a,b,c | set volume 0/1 | set notify 0/1  (saved in lcd.conf)
       const std::size_t sp2 = arg.find(' ');
       const std::string what = lower(arg.substr(0, sp2));
-      const std::string value =
-          sp2 == std::string::npos ? "" : trim(arg.substr(sp2 + 1));
+      const std::string value = sp2 == std::string::npos ? "" : trim(arg.substr(sp2 + 1));
       if (what == "volume" || what == "notify") {
         const bool on = value == "1" || lower(value) == "on";
         (what == "volume" ? cfg_.volumePopup : cfg_.notifications) = on;
-        saveConfigKey(what == "volume" ? "volume_popup" : "notifications",
-                      on ? "1" : "0");
+        saveConfigKey(what == "volume" ? "volume_popup" : "notifications", on ? "1" : "0");
         return "ok";
       }
       if (what == "modes") {
         std::vector<std::string> modes;
         for (const std::string &m : split(value, ',')) {
           const std::string name = lower(trim(m));
-          if (std::find(kAllModes.begin(), kAllModes.end(), name) !=
-                  kAllModes.end() &&
+          if (std::find(kAllModes.begin(), kAllModes.end(), name) != kAllModes.end() &&
               std::find(modes.begin(), modes.end(), name) == modes.end())
             modes.push_back(name);
         }
@@ -2117,8 +1971,8 @@ private:
 public:
   // Sends one datagram to the running program. When `reply` is given, waits
   // for the answer.
-  static bool ctlSend(const std::string &path, const std::string &msg,
-                      std::string *reply, int timeoutMs) {
+  static bool ctlSend(const std::string &path, const std::string &msg, std::string *reply,
+                      int timeoutMs) {
     const int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
       return false;
@@ -2133,8 +1987,7 @@ public:
       return false;
     }
     std::strcpy(to.sun_path, path.c_str());
-    if (::sendto(fd, msg.data(), msg.size(), 0,
-                 reinterpret_cast<sockaddr *>(&to), sizeof(to)) < 0) {
+    if (::sendto(fd, msg.data(), msg.size(), 0, reinterpret_cast<sockaddr *>(&to), sizeof(to)) < 0) {
       ::close(fd);
       return false;
     }
@@ -2159,23 +2012,20 @@ private:
   // ---- modes ---------------------------------------------------------------
   void step(int dir) {
     const int n = static_cast<int>(cfg_.modes.size());
-    setMode(static_cast<std::size_t>(((static_cast<int>(mode_) + dir) % n + n) %
-                                     n));
+    setMode(static_cast<std::size_t>(((static_cast<int>(mode_) + dir) % n + n) % n));
   }
 
   void setMode(std::size_t i) {
     mode_ = i;
     bannerUntil_ = Clock::now() + std::chrono::milliseconds(1200);
-    start_ = Clock::now() + std::chrono::milliseconds(
-                                1200); // status pages start from the first
+    start_ = Clock::now() + std::chrono::milliseconds(1200); // status pages start from the first
     std::error_code ec;
     fs::create_directories(configDir(), ec);
     std::ofstream(configDir() / "lcd.state") << cfg_.modes[mode_] << "\n";
   }
 
   static std::string trackText(const PlayerInfo &p) {
-    const std::string title =
-        cleanTitle(p.title).empty() ? p.title : cleanTitle(p.title);
+    const std::string title = cleanTitle(p.title).empty() ? p.title : cleanTitle(p.title);
     const std::string artist = cleanArtist(p.artist);
     if (title.empty())
       return artist;
@@ -2193,8 +2043,7 @@ private:
                        center(modeTitle(mode), cols));
     const std::vector<PlayerInfo> ps = mpris_.players();
 
-    // Popups come first: a notification for a few seconds, a volume bar for
-    // two.
+    // Popups come first: a notification for a few seconds, a volume bar for two.
     updatePopups(ps, now);
     if (now < noteUntil_)
       return textFrame(noteText_);
@@ -2236,8 +2085,7 @@ private:
     return lyricsFrame(ps, now);
   }
 
-  // ---- popups
-  // ----------------------------------------------------------------
+  // ---- popups ----------------------------------------------------------------
   static std::string cutUtf8(const std::string &s, std::size_t maxBytes) {
     if (s.size() <= maxBytes)
       return s;
@@ -2251,8 +2099,7 @@ private:
     // desktop notifications
     for (const Notification &n : notes_.take()) {
       if (!cfg_.notifications || lower(n.app) == "muzx")
-        continue; // MUZX's own "now playing" messages would only repeat the
-                  // screen
+        continue; // MUZX's own "now playing" messages would only repeat the screen
       std::string text = stripVttTags(n.summary);
       const std::string body = stripVttTags(n.body);
       if (!body.empty())
@@ -2261,8 +2108,7 @@ private:
         if (c == '\n' || c == '\r' || static_cast<unsigned char>(c) < 32)
           c = ' ';
       noteText_ = cutUtf8(text, 100);
-      noteUntil_ = now + std::chrono::milliseconds(
-                             static_cast<long>(cfg_.notifySeconds * 1000));
+      noteUntil_ = now + std::chrono::milliseconds(static_cast<long>(cfg_.notifySeconds * 1000));
     }
     // volume of the computer (pactl) ...
     const VolumeWatcher::State vs = volume_.state();
@@ -2293,29 +2139,23 @@ private:
   Frame volumeFrame() const {
     const int cols = cfg_.cols;
     const int pct = std::clamp(volumePercent_, 0, 150);
-    const std::string title =
-        volumeMuted_ ? "Volume muted" : "Volume " + std::to_string(pct) + "%";
+    const std::string title = volumeMuted_ ? "Volume muted" : "Volume " + std::to_string(pct) + "%";
     const int filled = volumeMuted_ ? 0 : std::clamp(pct * cols / 100, 0, cols);
     std::string bar;
     for (int i = 0; i < cols; ++i)
-      bar += i < filled ? '\x17'
-                        : '\x10'; // full block / thin line (custom characters)
+      bar += i < filled ? '\x17' : '\x10'; // full block / thin line (custom characters)
     return rowsFrame(center(title, cols), bar);
   }
 
   Frame spectrumFrame() {
     const int cols = cfg_.cols;
     if (spectrum_.status() == SpectrumTap::Status::NoTool)
-      return rowsFrame(center("Install parec", cols),
-                       center("(pipewire-pulse)", cols));
+      return rowsFrame(center("Install parec", cols), center("(pipewire-pulse)", cols));
     const std::vector<float> lv = spectrum_.levels();
     std::string top, bottom;
     for (int c = 0; c < cols; ++c) {
-      const float level = static_cast<std::size_t>(c) < lv.size()
-                              ? lv[static_cast<std::size_t>(c)]
-                              : 0.0F;
-      const int h = std::clamp(static_cast<int>(std::lround(level * 16.0F)), 0,
-                               16); // 2 rows x 8
+      const float level = static_cast<std::size_t>(c) < lv.size() ? lv[static_cast<std::size_t>(c)] : 0.0F;
+      const int h = std::clamp(static_cast<int>(std::lround(level * 16.0F)), 0, 16); // 2 rows x 8
       const int lowRow = std::min(h, 8), highRow = std::max(0, h - 8);
       bottom += lowRow > 0 ? static_cast<char>(0x10 + lowRow - 1) : ' ';
       top += highRow > 0 ? static_cast<char>(0x10 + highRow - 1) : ' ';
@@ -2327,49 +2167,40 @@ private:
     const int cols = cfg_.cols;
     const int pages = 3;
     const int page =
-        static_cast<int>(std::chrono::duration<double>(now - start_).count() /
-                         cfg_.pageSeconds) %
+        static_cast<int>(std::chrono::duration<double>(now - start_).count() / cfg_.pageSeconds) %
         pages;
     char a[64], b[64];
     if (page == 0) {
-      std::snprintf(a, sizeof(a), "CPU%3.0f%% RAM%3.0f%%", stats_.cpu(),
-                    stats_.ram());
+      std::snprintf(a, sizeof(a), "CPU%3.0f%% RAM%3.0f%%", stats_.cpu(), stats_.ram());
       if (stats_.temp() >= 0)
-        std::snprintf(b, sizeof(b), "Temp%3.0fC Ld %.1f", stats_.temp(),
-                      stats_.load());
+        std::snprintf(b, sizeof(b), "Temp%3.0fC Ld %.1f", stats_.temp(), stats_.load());
       else
         std::snprintf(b, sizeof(b), "Load %.2f", stats_.load());
     } else if (page == 1) {
-      std::snprintf(a, sizeof(a), "Net down %s",
-                    fmtRate(stats_.down()).c_str());
+      std::snprintf(a, sizeof(a), "Net down %s", fmtRate(stats_.down()).c_str());
       std::snprintf(b, sizeof(b), "Net up   %s", fmtRate(stats_.up()).c_str());
     } else {
       if (stats_.battery() >= 0) {
         const std::string st = stats_.batteryState();
         std::snprintf(a, sizeof(a), "Bat %d%% %s", stats_.battery(),
-                      st == "Charging" ? "chrg"
-                      : st == "Full"   ? "full"
-                                       : "");
+                      st == "Charging" ? "chrg" : st == "Full" ? "full" : "");
       } else {
         std::snprintf(a, sizeof(a), "No battery");
       }
       const long up = static_cast<long>(stats_.uptime());
       if (up >= 86400)
-        std::snprintf(b, sizeof(b), "Up %ldd %ldh", up / 86400,
-                      (up % 86400) / 3600);
+        std::snprintf(b, sizeof(b), "Up %ldd %ldh", up / 86400, (up % 86400) / 3600);
       else
-        std::snprintf(b, sizeof(b), "Up %ldh %02ldm", up / 3600,
-                      (up % 3600) / 60);
+        std::snprintf(b, sizeof(b), "Up %ldh %02ldm", up / 3600, (up % 3600) / 60);
     }
     return rowsFrame(fit(a, cols), fit(b, cols));
   }
 
   Frame lyricsFrame(const std::vector<PlayerInfo> &ps, Clock::time_point now) {
     const int cols = cfg_.cols;
-    const bool muzxPlaying =
-        std::any_of(ps.begin(), ps.end(), [](const PlayerInfo &p) {
-          return p.isMuzx() && p.playing();
-        });
+    const bool muzxPlaying = std::any_of(ps.begin(), ps.end(), [](const PlayerInfo &p) {
+      return p.isMuzx() && p.playing();
+    });
     const bool pushedFresh = now - pushedAt_ < std::chrono::seconds(4);
     const PlayerInfo *p = nullptr;
     if (!muzxPlaying) {
@@ -2391,25 +2222,22 @@ private:
       return rowsFrame(center("No music", cols), center("playing", cols));
     }
     // A failed lookup (no network yet, ...) is tried again after a while.
-    const bool retry = lyrics_ && lyrics_->state == Lookup::Failed &&
-                       lyrics_->ageSeconds() > 20.0;
+    const bool retry =
+        lyrics_ && lyrics_->state == Lookup::Failed && lyrics_->ageSeconds() > 20.0;
     if (!lyrics_ || lyrics_->key != p->key() || retry)
       lyrics_ = startLyricsLookup(*p);
     if (lyrics_->state == Lookup::Ready) {
       std::lock_guard<std::mutex> lock(lyrics_->mu);
       const int idx = lineAt(lyrics_->lines, p->position(now) + 0.25);
       if (idx >= 0)
-        return textFrame(
-            lyrics_->lines[static_cast<std::size_t>(idx)].text.empty()
-                ? "~ music ~"
-                : lyrics_->lines[static_cast<std::size_t>(idx)].text);
+        return textFrame(lyrics_->lines[static_cast<std::size_t>(idx)].text.empty()
+                             ? "~ music ~"
+                             : lyrics_->lines[static_cast<std::size_t>(idx)].text);
     }
-    return textFrame(
-        trackText(*p)); // searching, not found, or before the first line
+    return textFrame(trackText(*p)); // searching, not found, or before the first line
   }
 
-  Frame captionsFrame(const std::vector<PlayerInfo> &ps,
-                      Clock::time_point now) {
+  Frame captionsFrame(const std::vector<PlayerInfo> &ps, Clock::time_point now) {
     const int cols = cfg_.cols;
     const PlayerInfo *p = nullptr;
     for (const PlayerInfo &c : ps)
@@ -2424,8 +2252,7 @@ private:
           break;
         }
     if (!p || youtubeId(p->url).empty())
-      return rowsFrame(center("No YouTube", cols),
-                       center("video playing", cols));
+      return rowsFrame(center("No YouTube", cols), center("video playing", cols));
     const std::string key = youtubeId(p->url) + "|" + cfg_.captionsLang;
     // Try again later: yt-dlp may have been installed, or the network was down.
     bool retry = false;
@@ -2441,20 +2268,17 @@ private:
     case Lookup::Searching:
       return rowsFrame(center("Getting", cols), center("captions...", cols));
     case Lookup::NoTool:
-      return rowsFrame(center("Install yt-dlp", cols),
-                       center("for captions", cols));
+      return rowsFrame(center("Install yt-dlp", cols), center("for captions", cols));
     case Lookup::None:
     case Lookup::Failed:
-      return rowsFrame(center("No captions", cols),
-                       center("for this video", cols));
+      return rowsFrame(center("No captions", cols), center("for this video", cols));
     default:
       break;
     }
     std::lock_guard<std::mutex> lock(captions_->mu);
     const double pos = p->position(now);
     const int idx = lineAt(captions_->lines, pos);
-    if (idx >= 0 &&
-        pos < captions_->lines[static_cast<std::size_t>(idx)].end + 0.3)
+    if (idx >= 0 && pos < captions_->lines[static_cast<std::size_t>(idx)].end + 0.3)
       return textFrame(captions_->lines[static_cast<std::size_t>(idx)].text);
     return textFrame("");
   }
@@ -2480,16 +2304,13 @@ private:
   Clock::time_point noteUntil_{}, volumeUntil_{};
 };
 
+#ifndef MUZXLCD_TEST // the tests include this file and have their own main()
 int main(int argc, char **argv) {
-  if (argc >= 2 &&
-      (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
-    std::puts(
-        "muzxlcd            start the LCD program (keep it running in the "
-        "background)\n"
-        "muzxlcd ctl mode next | prev | lyrics | captions | nowplaying | "
-        "spectrum | clock | status\n"
-        "muzxlcd ctl modes | status | quit\n"
-        "muzxlcd ctl set modes lyrics,clock | set volume 0/1 | set notify 0/1");
+  if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    std::puts("muzxlcd            start the LCD program (keep it running in the background)\n"
+              "muzxlcd ctl mode next | prev | lyrics | captions | nowplaying | spectrum | clock | status\n"
+              "muzxlcd ctl modes | status | quit\n"
+              "muzxlcd ctl set modes lyrics,clock | set volume 0/1 | set notify 0/1");
     return 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "ctl") {
@@ -2500,8 +2321,7 @@ int main(int argc, char **argv) {
       msg = "status";
     std::string reply;
     if (!Hub::ctlSend(socketPath(), msg, &reply, 1500)) {
-      std::fprintf(stderr,
-                   "muzxlcd is not running (start it with: muzxlcd &)\n");
+      std::fprintf(stderr, "muzxlcd is not running (start it with: muzxlcd &)\n");
       return 1;
     }
     std::puts(reply.c_str());
@@ -2510,3 +2330,4 @@ int main(int argc, char **argv) {
   Hub hub(loadConfig());
   return hub.run();
 }
+#endif // MUZXLCD_TEST
